@@ -1,0 +1,247 @@
+---
+description: How to generate synthetic data (fixtures, mocks, seed data, test payloads) that conforms to airline-reservation.schema.json
+globs: ["**/fixtures/**", "**/mocks/**", "**/seed/**", "**/*.fixture.json", "**/*.mock.json", "**/*.synthetic.json"]
+alwaysApply: false
+---
+
+# Synthetic data for the airline reservation schema
+
+Use this rule whenever you create fixtures, mock API responses, seed data, or test payloads for `airline-reservation.schema.json`.
+
+## Core principle
+
+Synthetic data must be **obviously fake but schema-valid**. Every generated document must pass validation against the schema. Placeholder values like `XXX` or `1234` are encouraged, but they still have to satisfy the field's `pattern`, `format`, `enum`, `minLength` and `minimum` constraints. Check the schema before inventing a value. For example, an IATA airport code is exactly 3 uppercase letters, so `XXX` is valid and `XXXX` is not.
+
+Never use real personal data, real card numbers, real passport numbers, or real booking references.
+
+## Placeholder values
+
+| Field / type | Placeholder | Notes |
+|---|---|---|
+| `Uuid` | `00000000-0000-4000-8000-000000000001` | Increment the last digits for each distinct id. Keep the v4 shape so `format: uuid` passes. |
+| `DateTime` | `2026-12-01T14:30:00-06:00` | Must include a UTC offset. |
+| `LocalDate` | `2026-12-01` | |
+| `AirportCode` | `XXX`, `YYY` | Exactly 3 uppercase letters. Origin and destination must differ. |
+| `AirlineCode` | `XX` | 2 uppercase letters or digits. |
+| `FlightNumber` | `1234` | 1-4 digits, optional trailing letter. |
+| `CurrencyCode` | `USD` | Use one currency per document. |
+| `CountryCode` | `US` | |
+| `SeatNumber` | `12A`, `12B`, `14C` | Row 1-99, column A-K. |
+| `BookingReference` | `AAAAAA` or `TEST01` | Exactly 6 characters, A-Z and 0-9. |
+| `Money.amountMinor` | `1234` | Integer minor units (cents), never a float. `1234` means 12.34 USD. |
+| `Aircraft.icaoType` | `XXXX` | 2-4 characters, A-Z and 0-9. |
+| `Aircraft.configurationId` | `CONFIG-1234` | |
+| Names | `Test` / `Passenger` | Add a suffix per passenger: `Passenger1`, `Passenger2`. |
+| `dateOfBirth` | `1990-01-01` | Make children and infants plausible for their `type`. |
+| `email` | `test@example.com` | Use `example.com` only. |
+| `phone` | `+15550000001` | E.164: `+`, then 7-15 digits, no leading zero after the plus. |
+| `TravelDocument.number` | `1234` | |
+| `ticketNumber` | `1234567890123` | Exactly 13 digits. |
+| `paymentToken` | `tok_test_12345678` | At least 8 characters. Never a real card number or CVV. |
+| `last4` | `1234` | Exactly 4 digits. |
+| `idempotencyKey` | `idempotency-key-0001` | 16-64 characters. Unique per purchase request. |
+| `voucherCode` | `TESTVOUCHER1` | `^[A-Z0-9-]{6,24}$` |
+| `transactionId` | `txn-1234` | |
+| `confirmationNumber` | `CONF-1234` | |
+| `termsVersion` | `2026-10` | |
+| `Address` | `1 Test St`, `Testville`, `00000`, `US` | |
+
+## Messages
+
+The root schema accepts one of seven `messageType` values. Always set `messageType` to the exact `const` for the message you are building.
+
+1. `SeatAvailabilityRequest`
+2. `SeatAvailabilityResponse`
+3. `SeatHoldRequest`
+4. `SeatHoldResponse`
+5. `SeatPurchaseRequest`
+6. `SeatPurchaseResponse`
+7. `ErrorResponse`
+
+All schemas use `additionalProperties: false`. Do not add extra keys, and include every required key.
+
+### Seat availability request
+
+Pick one of the two `flight` shapes (never both): `{ "flightId": ... }` or `{ "airlineCode", "flightNumber", "departureDate" }`.
+
+```json
+{
+  "messageType": "SeatAvailabilityRequest",
+  "requestId": "00000000-0000-4000-8000-000000000001",
+  "flight": { "airlineCode": "XX", "flightNumber": "1234", "departureDate": "2026-12-01" },
+  "filters": { "cabins": ["economy"], "positions": ["window", "aisle"] }
+}
+```
+
+### Seat availability response
+
+Generate a small aircraft: 1-2 cabins, 3-6 rows each, 4-6 columns. Do not generate hundreds of seats.
+
+```json
+{
+  "messageType": "SeatAvailabilityResponse",
+  "requestId": "00000000-0000-4000-8000-000000000001",
+  "generatedAt": "2026-10-28T10:00:00-05:00",
+  "flight": {
+    "flightId": "00000000-0000-4000-8000-000000000010",
+    "airlineCode": "XX",
+    "flightNumber": "1234",
+    "origin": "XXX",
+    "destination": "YYY",
+    "scheduledDeparture": "2026-12-01T14:30:00-06:00",
+    "scheduledArrival": "2026-12-01T17:45:00-06:00",
+    "aircraft": { "icaoType": "XXXX", "configurationId": "CONFIG-1234" },
+    "status": "scheduled",
+    "seatSelectionOpen": true
+  },
+  "summary": [
+    { "cabin": "economy", "totalSeats": 4, "available": 2, "held": 1, "occupied": 1, "blocked": 0 }
+  ],
+  "layout": [
+    { "cabin": "economy", "firstRow": 10, "lastRow": 11, "columnLayout": ["A", "B", "aisle", "C", "D"] }
+  ],
+  "seats": [
+    { "seatNumber": "10A", "row": 10, "column": "A", "cabin": "economy", "status": "available",
+      "attributes": { "position": "window" },
+      "price": { "amountMinor": 1234, "currency": "USD" } },
+    { "seatNumber": "10B", "row": 10, "column": "B", "cabin": "economy", "status": "available",
+      "attributes": { "position": "aisle" },
+      "price": { "amountMinor": 1234, "currency": "USD" } },
+    { "seatNumber": "11A", "row": 11, "column": "A", "cabin": "economy", "status": "held",
+      "attributes": { "position": "window" },
+      "heldUntil": "2026-10-28T10:10:00-05:00" },
+    { "seatNumber": "11B", "row": 11, "column": "B", "cabin": "economy", "status": "occupied",
+      "attributes": { "position": "aisle" } }
+  ],
+  "seatMapVersion": "v1234"
+}
+```
+
+### Seat hold request and response
+
+The request lists seat numbers (1-9, unique). The response echoes `requestId`, returns a new `holdId`, and sets `expiresAt` to the generation time plus the hold length (default 600 seconds).
+
+### Seat purchase request
+
+```json
+{
+  "messageType": "SeatPurchaseRequest",
+  "requestId": "00000000-0000-4000-8000-000000000002",
+  "idempotencyKey": "idempotency-key-0001",
+  "flightId": "00000000-0000-4000-8000-000000000010",
+  "passengers": [
+    { "passengerId": "p1", "type": "adult", "firstName": "Test", "lastName": "Passenger1", "dateOfBirth": "1990-01-01" }
+  ],
+  "seatSelections": [
+    { "passengerId": "p1", "seatNumber": "10A", "expectedPrice": { "amountMinor": 1234, "currency": "USD" } }
+  ],
+  "contact": { "email": "test@example.com", "phone": "+15550000001" },
+  "payment": {
+    "method": "card",
+    "paymentToken": "tok_test_12345678",
+    "brand": "visa",
+    "last4": "1234",
+    "billingAddress": { "line1": "1 Test St", "city": "Testville", "postalCode": "00000", "country": "US" }
+  },
+  "expectedTotal": { "amountMinor": 1234, "currency": "USD" },
+  "termsAcceptedAt": "2026-10-28T10:05:00-05:00",
+  "termsVersion": "2026-10"
+}
+```
+
+For payment, `method` selects the shape. Vary it across fixtures: `card`, `digital_wallet`, `voucher`, `loyalty_miles`. Each has different required keys.
+
+### Seat purchase response
+
+Pick `status` first, because it decides which fields are required:
+
+- `confirmed` requires `bookingReference`, `confirmationNumber`, `flight`, `seatAssignments`, `charges`, `totalCharged`, `payment`, `purchasedAt`.
+- `pending_payment_action` requires `paymentAction` (`type`, `url`, `expiresAt`). Use `https://example.com/3ds/test`.
+- `failed` requires `error`.
+
+### Error response
+
+Use `ErrorResponse` for request-level failures. Use `SeatPurchaseResponse` with `status: "failed"` for failures that happen during a purchase attempt. Both carry the same `Error` object, so make `code`, `message` and `retryable` agree:
+
+| Code | `retryable` |
+|---|---|
+| `SEAT_UNAVAILABLE`, `PRICE_CHANGED`, `SEAT_MAP_STALE`, `HOLD_EXPIRED` | `false` (the client must re-query or re-hold first) |
+| `PAYMENT_DECLINED` | `false` |
+| `RATE_LIMITED`, `INTERNAL_ERROR` | `true` |
+
+## Consistency rules
+
+Schema validation alone will not catch these. Enforce them when generating.
+
+**Identity and linkage**
+- Every response echoes the `requestId` of its request.
+- Within one scenario, reuse the same `flightId`, flight details and seat numbers across the availability response, hold, purchase request and purchase response.
+- Every `seatSelections[].passengerId` must match a `passengers[].passengerId`. Passenger ids are unique within a request.
+- An `infant_in_lap` passenger gets no seat selection. Each `infant_*` passenger needs `associatedAdultPassengerId` pointing at an adult.
+
+**Seats**
+- `seatNumber` equals `row` + `column` (`14C` means row 14, column C).
+- `column` appears in the cabin's `columnLayout`, and `position` matches it: the first and last seat columns are `window`, columns beside an `aisle` marker are `aisle`, the rest are `middle`.
+- A seat with `status: "available"` has `price`. A seat with `status: "held"` has `heldUntil`.
+- Do not use a seat number from `missingRows`, and keep rows inside `firstRow`..`lastRow`.
+- Exit row seats have `exitRow: true`, and rows listed in `exitRows` agree with seat attributes.
+
+**Counts and money**
+- In `summary`, `available + held + occupied + blocked = totalSeats`, and the counts match the full seat population of that cabin. If `seats` is filtered, the summary still describes the whole cabin.
+- `expectedTotal` equals the sum of the `expectedPrice` values (plus any taxes you model as charges).
+- `totalCharged` equals the sum of the `charges` amounts. Use one currency throughout.
+- Each `seatAssignments[].price` equals the price the seat was quoted at.
+- Do not use negative amounts. Model discounts as a `charges` line of type `discount` with a positive amount, and make the arithmetic work in the document.
+
+**Time**
+- `scheduledArrival` is after `scheduledDeparture`.
+- `generatedAt` is before `priceValidUntil`, `heldUntil` and `expiresAt` values.
+- `termsAcceptedAt` is before `purchasedAt`.
+- Use `2026-10-28` as "today" unless the test needs another date.
+
+## Scenario coverage
+
+When asked for a fixture set, generate at least these:
+
+1. Happy path: availability, hold, purchase confirmed, one adult, one seat, card payment.
+2. Multi-passenger: adult plus child plus lap infant, two seats, contiguous seat numbers.
+3. Filtered lookup: `seatsTogether`, `requireExitRow`, `requireExtraLegroom`.
+4. Hold expired: purchase failure with `HOLD_EXPIRED`.
+5. Price changed: `PRICE_CHANGED` with the new price in `details`.
+6. Seat taken: `SEAT_UNAVAILABLE` with `details[].seatNumber`.
+7. 3-D Secure: `pending_payment_action`.
+8. Each non-card payment method (`digital_wallet`, `voucher`, `loyalty_miles`).
+9. Closed flight: `seatSelectionOpen: false` and `FLIGHT_CLOSED_FOR_SALES`.
+
+For **invalid-data fixtures** (to test validation), change exactly one thing per file, name the file after the violation (`purchase-request.bad-seat-number.json`), and keep everything else valid. Typical violations: seat `14Z`, 5-letter airport code, missing `termsAcceptedAt`, `amountMinor` as `12.34`, extra unknown key, infant without `associatedAdultPassengerId`, `confirmed` response without `bookingReference`.
+
+## Generation practices
+
+- Make output deterministic. If you use random values, use a fixed seed so regenerated fixtures do not produce noisy diffs.
+- Generate the minimum needed. Tests rarely need more than a handful of seats.
+- Put one message per file, named `<scenario>.<message-type>.json`, for example `happy-path.seat-purchase-request.json`.
+- Never put real-looking secrets, card numbers, CVV values or real passport numbers in fixtures, even as examples.
+
+## Validation
+
+Validate every generated file before finishing. Check the root schema, and when you want a specific message type, validate against its `$defs` entry directly.
+
+```bash
+# Python
+pip install jsonschema
+python - <<'EOF'
+import json, sys
+from jsonschema import Draft202012Validator
+schema = json.load(open("airline-reservation.schema.json"))
+inst = json.load(open(sys.argv[1]))
+errors = list(Draft202012Validator(schema).iter_errors(inst))
+print("OK" if not errors else "\n".join(e.message for e in errors))
+EOF
+```
+
+```bash
+# Node (ajv-cli)
+npx ajv-cli validate --spec=draft2020 -s airline-reservation.schema.json -d "fixtures/*.json"
+```
+
+If validation fails, fix the data, not the schema, unless the user explicitly asked for a schema change.

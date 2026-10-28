@@ -1,0 +1,59 @@
+# ==========================================
+# CLion / JetBrains IDE Settings
+# ==========================================
+.idea/
+# Optional: If you want to share common team run configurations and code style settings,
+# uncomment the lines below to keep them in version control:
+# !.idea/runConfigurations/
+# !.idea/codeStyles/
+
+# ==========================================
+# C++ Build Directories (CMake / Ninja / etc.)
+# ==========================================
+cmake-build-*/
+build/
+out/
+bin/
+
+# ==========================================
+# Compiled C/C++ Artifacts
+# ==========================================
+*.o
+*.obj
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.la
+*.lai
+*.sli
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Executables
+*.exe
+*.out
+*.app
+
+# ==========================================
+# Tooling & Core Dumps
+# ==========================================
+# Clang / LLVM tracking
+.clang-tidy
+.clang-format
+
+# Core dumps
+core
+*.stackdump
+
+# ==========================================
+# OS-Specific Garbage
+# ==========================================
+.DS_Store
+Thumbs.db
+
+# Project
+.env

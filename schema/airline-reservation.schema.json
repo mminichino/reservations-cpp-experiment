@@ -1,0 +1,778 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/airline-reservation.schema.json",
+  "title": "Airline Reservation System",
+  "description": "Message and data structures for looking up seat availability on a flight, holding seats, and purchasing a seat. The root accepts any one of the message types defined in $defs.",
+  "oneOf": [
+    { "$ref": "#/$defs/SeatAvailabilityRequest" },
+    { "$ref": "#/$defs/SeatAvailabilityResponse" },
+    { "$ref": "#/$defs/SeatHoldRequest" },
+    { "$ref": "#/$defs/SeatHoldResponse" },
+    { "$ref": "#/$defs/SeatPurchaseRequest" },
+    { "$ref": "#/$defs/SeatPurchaseResponse" },
+    { "$ref": "#/$defs/ErrorResponse" }
+  ],
+
+  "$defs": {
+
+    "Uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "DateTime": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 timestamp with offset, e.g. 2026-12-01T14:30:00-06:00."
+    },
+    "LocalDate": {
+      "type": "string",
+      "format": "date",
+      "description": "Date in YYYY-MM-DD."
+    },
+    "AirportCode": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$",
+      "description": "IATA airport code, e.g. IAH."
+    },
+    "AirlineCode": {
+      "type": "string",
+      "pattern": "^[A-Z0-9]{2}$",
+      "description": "IATA airline designator, e.g. UA."
+    },
+    "FlightNumber": {
+      "type": "string",
+      "pattern": "^[0-9]{1,4}[A-Z]?$",
+      "description": "Numeric flight number without the airline prefix."
+    },
+    "CurrencyCode": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$",
+      "description": "ISO 4217 currency code."
+    },
+    "CountryCode": {
+      "type": "string",
+      "pattern": "^[A-Z]{2}$",
+      "description": "ISO 3166-1 alpha-2 country code."
+    },
+    "SeatNumber": {
+      "type": "string",
+      "pattern": "^[0-9]{1,2}[A-K]$",
+      "description": "Row number followed by column letter, e.g. 14C."
+    },
+    "BookingReference": {
+      "type": "string",
+      "pattern": "^[A-Z0-9]{6}$",
+      "description": "Six-character PNR record locator."
+    },
+
+    "Money": {
+      "type": "object",
+      "description": "Amount in minor units (e.g. cents) to avoid floating point errors.",
+      "properties": {
+        "amountMinor": { "type": "integer", "minimum": 0 },
+        "currency": { "$ref": "#/$defs/CurrencyCode" }
+      },
+      "required": ["amountMinor", "currency"],
+      "additionalProperties": false
+    },
+
+    "CabinClass": {
+      "type": "string",
+      "enum": ["economy", "premium_economy", "business", "first"]
+    },
+
+    "SeatStatus": {
+      "type": "string",
+      "enum": ["available", "held", "occupied", "blocked"],
+      "description": "available: can be purchased. held: temporarily reserved by a hold. occupied: sold. blocked: not for sale (crew, operational, or accessibility reserve)."
+    },
+
+    "Address": {
+      "type": "object",
+      "properties": {
+        "line1": { "type": "string", "maxLength": 100 },
+        "line2": { "type": "string", "maxLength": 100 },
+        "city": { "type": "string", "maxLength": 60 },
+        "region": { "type": "string", "maxLength": 60 },
+        "postalCode": { "type": "string", "maxLength": 20 },
+        "country": { "$ref": "#/$defs/CountryCode" }
+      },
+      "required": ["line1", "city", "postalCode", "country"],
+      "additionalProperties": false
+    },
+
+    "Aircraft": {
+      "type": "object",
+      "properties": {
+        "icaoType": { "type": "string", "pattern": "^[A-Z0-9]{2,4}$", "description": "ICAO aircraft type, e.g. B738." },
+        "name": { "type": "string", "description": "Marketing name, e.g. Boeing 737-800." },
+        "configurationId": { "type": "string", "description": "Identifier of the cabin layout version used to build the seat map." },
+        "registration": { "type": "string" }
+      },
+      "required": ["icaoType", "configurationId"],
+      "additionalProperties": false
+    },
+
+    "Flight": {
+      "type": "object",
+      "properties": {
+        "flightId": { "$ref": "#/$defs/Uuid" },
+        "airlineCode": { "$ref": "#/$defs/AirlineCode" },
+        "flightNumber": { "$ref": "#/$defs/FlightNumber" },
+        "origin": { "$ref": "#/$defs/AirportCode" },
+        "destination": { "$ref": "#/$defs/AirportCode" },
+        "scheduledDeparture": { "$ref": "#/$defs/DateTime" },
+        "scheduledArrival": { "$ref": "#/$defs/DateTime" },
+        "terminal": { "type": "string" },
+        "gate": { "type": "string" },
+        "aircraft": { "$ref": "#/$defs/Aircraft" },
+        "status": {
+          "type": "string",
+          "enum": ["scheduled", "boarding", "departed", "arrived", "delayed", "cancelled"]
+        },
+        "seatSelectionOpen": {
+          "type": "boolean",
+          "description": "False once seat sales have closed (e.g. after check-in cutoff)."
+        }
+      },
+      "required": ["flightId", "airlineCode", "flightNumber", "origin", "destination", "scheduledDeparture", "scheduledArrival", "status"],
+      "additionalProperties": false
+    },
+
+    "SeatAttributes": {
+      "type": "object",
+      "properties": {
+        "position": { "type": "string", "enum": ["window", "middle", "aisle"] },
+        "exitRow": { "type": "boolean", "default": false },
+        "extraLegroom": { "type": "boolean", "default": false },
+        "bulkhead": { "type": "boolean", "default": false },
+        "nearLavatory": { "type": "boolean", "default": false },
+        "nearGalley": { "type": "boolean", "default": false },
+        "limitedRecline": { "type": "boolean", "default": false },
+        "powerOutlet": { "type": "boolean", "default": false },
+        "usb": { "type": "boolean", "default": false },
+        "personalScreen": { "type": "boolean", "default": false },
+        "wheelchairAccessible": { "type": "boolean", "default": false },
+        "bassinetPosition": { "type": "boolean", "default": false },
+        "adjacentSeatNumbers": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SeatNumber" },
+          "description": "Seats directly next to this one in the same row group."
+        }
+      },
+      "required": ["position"],
+      "additionalProperties": false
+    },
+
+    "SeatRestrictions": {
+      "type": "object",
+      "description": "Passenger eligibility rules for a seat.",
+      "properties": {
+        "minAge": { "type": "integer", "minimum": 0, "description": "Exit rows typically require 15 or older." },
+        "noInfants": { "type": "boolean" },
+        "noChildrenUnaccompanied": { "type": "boolean" },
+        "requiresAbleBodied": { "type": "boolean" },
+        "eliteTiersOnly": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Loyalty tiers allowed to select this seat for free or at all."
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "Seat": {
+      "type": "object",
+      "properties": {
+        "seatNumber": { "$ref": "#/$defs/SeatNumber" },
+        "row": { "type": "integer", "minimum": 1, "maximum": 99 },
+        "column": { "type": "string", "pattern": "^[A-K]$" },
+        "cabin": { "$ref": "#/$defs/CabinClass" },
+        "status": { "$ref": "#/$defs/SeatStatus" },
+        "attributes": { "$ref": "#/$defs/SeatAttributes" },
+        "restrictions": { "$ref": "#/$defs/SeatRestrictions" },
+        "price": {
+          "$ref": "#/$defs/Money",
+          "description": "Price for selecting this seat. Required when status is available."
+        },
+        "priceValidUntil": {
+          "$ref": "#/$defs/DateTime",
+          "description": "Quoted price is guaranteed until this time."
+        },
+        "heldUntil": {
+          "$ref": "#/$defs/DateTime",
+          "description": "Present only when status is held, so clients can retry after expiry."
+        }
+      },
+      "required": ["seatNumber", "row", "column", "cabin", "status", "attributes"],
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "available" } }, "required": ["status"] },
+          "then": { "required": ["price"] }
+        }
+      ],
+      "additionalProperties": false
+    },
+
+    "CabinLayout": {
+      "type": "object",
+      "description": "Geometry of a cabin so UIs can draw the seat map.",
+      "properties": {
+        "cabin": { "$ref": "#/$defs/CabinClass" },
+        "firstRow": { "type": "integer", "minimum": 1 },
+        "lastRow": { "type": "integer", "minimum": 1 },
+        "columnLayout": {
+          "type": "array",
+          "description": "Ordered columns with aisle markers, e.g. [\"A\",\"B\",\"C\",\"aisle\",\"D\",\"E\",\"F\"].",
+          "items": { "type": "string", "pattern": "^([A-K]|aisle)$" }
+        },
+        "exitRows": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 1 }
+        },
+        "missingRows": {
+          "type": "array",
+          "description": "Row numbers skipped on this aircraft (e.g. 13).",
+          "items": { "type": "integer", "minimum": 1 }
+        }
+      },
+      "required": ["cabin", "firstRow", "lastRow", "columnLayout"],
+      "additionalProperties": false
+    },
+
+    "SeatAvailabilityRequest": {
+      "type": "object",
+      "title": "SeatAvailabilityRequest",
+      "properties": {
+        "messageType": { "const": "SeatAvailabilityRequest" },
+        "requestId": { "$ref": "#/$defs/Uuid" },
+        "flight": {
+          "description": "Identify the flight either by internal id or by airline, number, and departure date.",
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": { "flightId": { "$ref": "#/$defs/Uuid" } },
+              "required": ["flightId"],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "airlineCode": { "$ref": "#/$defs/AirlineCode" },
+                "flightNumber": { "$ref": "#/$defs/FlightNumber" },
+                "departureDate": { "$ref": "#/$defs/LocalDate", "description": "Local date at the origin airport." }
+              },
+              "required": ["airlineCode", "flightNumber", "departureDate"],
+              "additionalProperties": false
+            }
+          ]
+        },
+        "filters": {
+          "type": "object",
+          "properties": {
+            "cabins": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/CabinClass" },
+              "uniqueItems": true
+            },
+            "statuses": {
+              "type": "array",
+              "items": { "$ref": "#/$defs/SeatStatus" },
+              "uniqueItems": true,
+              "default": ["available"]
+            },
+            "positions": {
+              "type": "array",
+              "items": { "type": "string", "enum": ["window", "middle", "aisle"] },
+              "uniqueItems": true
+            },
+            "requireExitRow": { "type": "boolean" },
+            "requireExtraLegroom": { "type": "boolean" },
+            "requirePowerOutlet": { "type": "boolean" },
+            "requireWheelchairAccessible": { "type": "boolean" },
+            "maxPrice": { "$ref": "#/$defs/Money" },
+            "seatsTogether": {
+              "type": "integer",
+              "minimum": 2,
+              "maximum": 9,
+              "description": "Only return seats that are part of a contiguous group of at least this many available seats."
+            }
+          },
+          "additionalProperties": false
+        },
+        "passengerContext": {
+          "type": "array",
+          "description": "Optional. Lets the system apply eligibility restrictions and loyalty pricing.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "passengerType": { "$ref": "#/$defs/PassengerType" },
+              "loyaltyTier": { "type": "string" }
+            },
+            "required": ["passengerType"],
+            "additionalProperties": false
+          },
+          "maxItems": 9
+        },
+        "includeLayout": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include cabin geometry in the response."
+        },
+        "currency": { "$ref": "#/$defs/CurrencyCode", "description": "Currency for quoted prices." }
+      },
+      "required": ["messageType", "requestId", "flight"],
+      "additionalProperties": false
+    },
+
+    "SeatAvailabilityResponse": {
+      "type": "object",
+      "title": "SeatAvailabilityResponse",
+      "properties": {
+        "messageType": { "const": "SeatAvailabilityResponse" },
+        "requestId": { "$ref": "#/$defs/Uuid" },
+        "generatedAt": { "$ref": "#/$defs/DateTime" },
+        "flight": { "$ref": "#/$defs/Flight" },
+        "summary": {
+          "type": "array",
+          "description": "Counts per cabin across the whole aircraft, ignoring filters.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "cabin": { "$ref": "#/$defs/CabinClass" },
+              "totalSeats": { "type": "integer", "minimum": 0 },
+              "available": { "type": "integer", "minimum": 0 },
+              "held": { "type": "integer", "minimum": 0 },
+              "occupied": { "type": "integer", "minimum": 0 },
+              "blocked": { "type": "integer", "minimum": 0 }
+            },
+            "required": ["cabin", "totalSeats", "available", "held", "occupied", "blocked"],
+            "additionalProperties": false
+          }
+        },
+        "layout": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/CabinLayout" }
+        },
+        "seats": {
+          "type": "array",
+          "description": "Seats matching the request filters.",
+          "items": { "$ref": "#/$defs/Seat" }
+        },
+        "seatMapVersion": {
+          "type": "string",
+          "description": "Opaque version token. Changes whenever seat inventory changes."
+        }
+      },
+      "required": ["messageType", "requestId", "generatedAt", "flight", "summary", "seats", "seatMapVersion"],
+      "additionalProperties": false
+    },
+
+    "PassengerType": {
+      "type": "string",
+      "enum": ["adult", "child", "infant_in_lap", "infant_in_seat"]
+    },
+
+    "TravelDocument": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["passport", "national_id", "known_traveler_number", "visa", "residence_permit"] },
+        "number": { "type": "string", "maxLength": 40 },
+        "issuingCountry": { "$ref": "#/$defs/CountryCode" },
+        "expiryDate": { "$ref": "#/$defs/LocalDate" }
+      },
+      "required": ["type", "number", "issuingCountry"],
+      "additionalProperties": false
+    },
+
+    "Passenger": {
+      "type": "object",
+      "properties": {
+        "passengerId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 36,
+          "description": "Client-assigned id unique within the request. Referenced by seat selections."
+        },
+        "type": { "$ref": "#/$defs/PassengerType" },
+        "title": { "type": "string", "enum": ["MR", "MS", "MRS", "MX", "DR", "MSTR", "MISS"] },
+        "firstName": { "type": "string", "minLength": 1, "maxLength": 60, "description": "As shown on travel document." },
+        "middleName": { "type": "string", "maxLength": 60 },
+        "lastName": { "type": "string", "minLength": 1, "maxLength": 60 },
+        "dateOfBirth": { "$ref": "#/$defs/LocalDate" },
+        "gender": { "type": "string", "enum": ["female", "male", "unspecified"] },
+        "nationality": { "$ref": "#/$defs/CountryCode" },
+        "documents": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/TravelDocument" }
+        },
+        "frequentFlyer": {
+          "type": "object",
+          "properties": {
+            "programCode": { "$ref": "#/$defs/AirlineCode" },
+            "memberNumber": { "type": "string" },
+            "tier": { "type": "string" }
+          },
+          "required": ["programCode", "memberNumber"],
+          "additionalProperties": false
+        },
+        "specialAssistance": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["wheelchair_ramp", "wheelchair_steps", "wheelchair_cabin", "visual_impairment", "hearing_impairment", "cognitive_assistance", "service_animal", "oxygen", "stretcher"]
+          },
+          "uniqueItems": true
+        },
+        "associatedAdultPassengerId": {
+          "type": "string",
+          "description": "Required for infants and for children travelling with an adult."
+        }
+      },
+      "required": ["passengerId", "type", "firstName", "lastName", "dateOfBirth"],
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "enum": ["infant_in_lap", "infant_in_seat"] } }, "required": ["type"] },
+          "then": { "required": ["associatedAdultPassengerId"] }
+        }
+      ],
+      "additionalProperties": false
+    },
+
+    "ContactInfo": {
+      "type": "object",
+      "properties": {
+        "email": { "type": "string", "format": "email" },
+        "phone": { "type": "string", "pattern": "^\\+[1-9][0-9]{6,14}$", "description": "E.164 format." },
+        "preferredLanguage": { "type": "string", "pattern": "^[a-z]{2}(-[A-Z]{2})?$" }
+      },
+      "required": ["email", "phone"],
+      "additionalProperties": false
+    },
+
+    "SeatSelection": {
+      "type": "object",
+      "properties": {
+        "passengerId": { "type": "string", "minLength": 1 },
+        "seatNumber": { "$ref": "#/$defs/SeatNumber" },
+        "expectedPrice": {
+          "$ref": "#/$defs/Money",
+          "description": "Price the customer saw. The purchase fails with PRICE_CHANGED if it no longer matches."
+        }
+      },
+      "required": ["passengerId", "seatNumber", "expectedPrice"],
+      "additionalProperties": false
+    },
+
+    "SeatHoldRequest": {
+      "type": "object",
+      "title": "SeatHoldRequest",
+      "description": "Temporarily reserves seats while the customer completes payment.",
+      "properties": {
+        "messageType": { "const": "SeatHoldRequest" },
+        "requestId": { "$ref": "#/$defs/Uuid" },
+        "flightId": { "$ref": "#/$defs/Uuid" },
+        "seatMapVersion": { "type": "string", "description": "Version from the availability response the selection was based on." },
+        "seats": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 9,
+          "items": { "$ref": "#/$defs/SeatNumber" },
+          "uniqueItems": true
+        },
+        "requestedHoldSeconds": { "type": "integer", "minimum": 60, "maximum": 1800, "default": 600 }
+      },
+      "required": ["messageType", "requestId", "flightId", "seats"],
+      "additionalProperties": false
+    },
+
+    "SeatHoldResponse": {
+      "type": "object",
+      "title": "SeatHoldResponse",
+      "properties": {
+        "messageType": { "const": "SeatHoldResponse" },
+        "requestId": { "$ref": "#/$defs/Uuid" },
+        "holdId": { "$ref": "#/$defs/Uuid" },
+        "flightId": { "$ref": "#/$defs/Uuid" },
+        "heldSeats": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "seatNumber": { "$ref": "#/$defs/SeatNumber" },
+              "price": { "$ref": "#/$defs/Money" }
+            },
+            "required": ["seatNumber", "price"],
+            "additionalProperties": false
+          }
+        },
+        "expiresAt": { "$ref": "#/$defs/DateTime" },
+        "totalPrice": { "$ref": "#/$defs/Money" }
+      },
+      "required": ["messageType", "requestId", "holdId", "flightId", "heldSeats", "expiresAt", "totalPrice"],
+      "additionalProperties": false
+    },
+
+    "CardPayment": {
+      "type": "object",
+      "description": "Tokenized card. Raw card numbers and CVV must never be sent to this API.",
+      "properties": {
+        "method": { "const": "card" },
+        "paymentToken": { "type": "string", "minLength": 8, "description": "Single-use token from the payment processor's client SDK." },
+        "brand": { "type": "string", "enum": ["visa", "mastercard", "amex", "discover", "diners", "jcb", "unionpay"] },
+        "last4": { "type": "string", "pattern": "^[0-9]{4}$" },
+        "cardholderName": { "type": "string", "maxLength": 100 },
+        "billingAddress": { "$ref": "#/$defs/Address" },
+        "threeDSecureResult": {
+          "type": "object",
+          "properties": {
+            "authenticationId": { "type": "string" },
+            "status": { "type": "string", "enum": ["authenticated", "attempted", "not_enrolled"] }
+          },
+          "required": ["authenticationId", "status"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["method", "paymentToken", "brand", "last4", "billingAddress"],
+      "additionalProperties": false
+    },
+
+    "WalletPayment": {
+      "type": "object",
+      "properties": {
+        "method": { "const": "digital_wallet" },
+        "provider": { "type": "string", "enum": ["apple_pay", "google_pay", "paypal"] },
+        "paymentToken": { "type": "string", "minLength": 8 }
+      },
+      "required": ["method", "provider", "paymentToken"],
+      "additionalProperties": false
+    },
+
+    "VoucherPayment": {
+      "type": "object",
+      "properties": {
+        "method": { "const": "voucher" },
+        "voucherCode": { "type": "string", "pattern": "^[A-Z0-9-]{6,24}$" }
+      },
+      "required": ["method", "voucherCode"],
+      "additionalProperties": false
+    },
+
+    "MilesPayment": {
+      "type": "object",
+      "properties": {
+        "method": { "const": "loyalty_miles" },
+        "programCode": { "$ref": "#/$defs/AirlineCode" },
+        "memberNumber": { "type": "string" },
+        "milesToRedeem": { "type": "integer", "minimum": 1 }
+      },
+      "required": ["method", "programCode", "memberNumber", "milesToRedeem"],
+      "additionalProperties": false
+    },
+
+    "PaymentMethod": {
+      "oneOf": [
+        { "$ref": "#/$defs/CardPayment" },
+        { "$ref": "#/$defs/WalletPayment" },
+        { "$ref": "#/$defs/VoucherPayment" },
+        { "$ref": "#/$defs/MilesPayment" }
+      ],
+      "discriminator": { "propertyName": "method" }
+    },
+
+    "SeatPurchaseRequest": {
+      "type": "object",
+      "title": "SeatPurchaseRequest",
+      "description": "Purchases one or more seats on a flight for the listed passengers.",
+      "properties": {
+        "messageType": { "const": "SeatPurchaseRequest" },
+        "requestId": { "$ref": "#/$defs/Uuid" },
+        "idempotencyKey": {
+          "type": "string",
+          "minLength": 16,
+          "maxLength": 64,
+          "description": "Retrying with the same key returns the original result instead of charging twice."
+        },
+        "flightId": { "$ref": "#/$defs/Uuid" },
+        "bookingReference": {
+          "$ref": "#/$defs/BookingReference",
+          "description": "Existing PNR when adding seats to a booking. Omit to create a new booking."
+        },
+        "holdId": {
+          "$ref": "#/$defs/Uuid",
+          "description": "Hold from SeatHoldResponse. If omitted, seats are held and purchased atomically."
+        },
+        "fareClass": { "type": "string", "pattern": "^[A-Z]$", "description": "Booking class letter (RBD) of the ticket, e.g. Y." },
+        "passengers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 9,
+          "items": { "$ref": "#/$defs/Passenger" }
+        },
+        "seatSelections": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 9,
+          "items": { "$ref": "#/$defs/SeatSelection" }
+        },
+        "contact": { "$ref": "#/$defs/ContactInfo" },
+        "payment": { "$ref": "#/$defs/PaymentMethod" },
+        "expectedTotal": {
+          "$ref": "#/$defs/Money",
+          "description": "Sum of seat prices and taxes the customer agreed to pay."
+        },
+        "termsAcceptedAt": { "$ref": "#/$defs/DateTime" },
+        "termsVersion": { "type": "string" }
+      },
+      "required": ["messageType", "requestId", "idempotencyKey", "flightId", "passengers", "seatSelections", "contact", "payment", "expectedTotal", "termsAcceptedAt", "termsVersion"],
+      "additionalProperties": false
+    },
+
+    "ChargeLine": {
+      "type": "object",
+      "properties": {
+        "type": { "type": "string", "enum": ["seat_fee", "tax", "service_fee", "discount", "miles_redemption"] },
+        "description": { "type": "string" },
+        "passengerId": { "type": "string" },
+        "seatNumber": { "$ref": "#/$defs/SeatNumber" },
+        "amount": { "$ref": "#/$defs/Money" }
+      },
+      "required": ["type", "description", "amount"],
+      "additionalProperties": false
+    },
+
+    "SeatAssignment": {
+      "type": "object",
+      "properties": {
+        "passengerId": { "type": "string" },
+        "seatNumber": { "$ref": "#/$defs/SeatNumber" },
+        "cabin": { "$ref": "#/$defs/CabinClass" },
+        "ticketNumber": { "type": "string", "pattern": "^[0-9]{13}$" },
+        "price": { "$ref": "#/$defs/Money" }
+      },
+      "required": ["passengerId", "seatNumber", "cabin", "price"],
+      "additionalProperties": false
+    },
+
+    "SeatPurchaseResponse": {
+      "type": "object",
+      "title": "SeatPurchaseResponse",
+      "properties": {
+        "messageType": { "const": "SeatPurchaseResponse" },
+        "requestId": { "$ref": "#/$defs/Uuid" },
+        "status": {
+          "type": "string",
+          "enum": ["confirmed", "pending_payment_action", "failed"],
+          "description": "pending_payment_action means the customer must complete an extra step such as 3-D Secure; see paymentAction."
+        },
+        "bookingReference": { "$ref": "#/$defs/BookingReference" },
+        "confirmationNumber": { "type": "string", "description": "Customer-facing receipt number." },
+        "flight": { "$ref": "#/$defs/Flight" },
+        "seatAssignments": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/SeatAssignment" }
+        },
+        "charges": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/ChargeLine" }
+        },
+        "totalCharged": { "$ref": "#/$defs/Money" },
+        "payment": {
+          "type": "object",
+          "properties": {
+            "transactionId": { "type": "string" },
+            "method": { "type": "string", "enum": ["card", "digital_wallet", "voucher", "loyalty_miles"] },
+            "authorizedAt": { "$ref": "#/$defs/DateTime" },
+            "last4": { "type": "string", "pattern": "^[0-9]{4}$" }
+          },
+          "required": ["transactionId", "method", "authorizedAt"],
+          "additionalProperties": false
+        },
+        "paymentAction": {
+          "type": "object",
+          "description": "Present only when status is pending_payment_action.",
+          "properties": {
+            "type": { "type": "string", "enum": ["redirect", "three_d_secure_challenge"] },
+            "url": { "type": "string", "format": "uri" },
+            "expiresAt": { "$ref": "#/$defs/DateTime" }
+          },
+          "required": ["type", "url", "expiresAt"],
+          "additionalProperties": false
+        },
+        "purchasedAt": { "$ref": "#/$defs/DateTime" },
+        "error": { "$ref": "#/$defs/Error" }
+      },
+      "required": ["messageType", "requestId", "status"],
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "confirmed" } }, "required": ["status"] },
+          "then": { "required": ["bookingReference", "confirmationNumber", "flight", "seatAssignments", "charges", "totalCharged", "payment", "purchasedAt"] }
+        },
+        {
+          "if": { "properties": { "status": { "const": "pending_payment_action" } }, "required": ["status"] },
+          "then": { "required": ["paymentAction"] }
+        },
+        {
+          "if": { "properties": { "status": { "const": "failed" } }, "required": ["status"] },
+          "then": { "required": ["error"] }
+        }
+      ],
+      "additionalProperties": false
+    },
+
+    "Error": {
+      "type": "object",
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "VALIDATION_FAILED",
+            "FLIGHT_NOT_FOUND",
+            "FLIGHT_CLOSED_FOR_SALES",
+            "SEAT_NOT_FOUND",
+            "SEAT_UNAVAILABLE",
+            "SEAT_RESTRICTED_FOR_PASSENGER",
+            "HOLD_EXPIRED",
+            "HOLD_NOT_FOUND",
+            "SEAT_MAP_STALE",
+            "PRICE_CHANGED",
+            "PAYMENT_DECLINED",
+            "PAYMENT_ACTION_REQUIRED",
+            "DUPLICATE_REQUEST",
+            "RATE_LIMITED",
+            "INTERNAL_ERROR"
+          ]
+        },
+        "message": { "type": "string" },
+        "retryable": { "type": "boolean" },
+        "details": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "field": { "type": "string", "description": "JSON Pointer to the offending field." },
+              "issue": { "type": "string" },
+              "seatNumber": { "$ref": "#/$defs/SeatNumber" }
+            },
+            "required": ["issue"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["code", "message", "retryable"],
+      "additionalProperties": false
+    },
+
+    "ErrorResponse": {
+      "type": "object",
+      "title": "ErrorResponse",
+      "properties": {
+        "messageType": { "const": "ErrorResponse" },
+        "requestId": { "$ref": "#/$defs/Uuid" },
+        "error": { "$ref": "#/$defs/Error" }
+      },
+      "required": ["messageType", "error"],
+      "additionalProperties": false
+    }
+  }
+}

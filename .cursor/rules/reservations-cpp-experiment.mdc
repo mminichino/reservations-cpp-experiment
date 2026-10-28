@@ -1,0 +1,72 @@
+---
+description: Airline Reservation System Experiment project context and compatibility requirements
+alwaysApply: true
+---
+
+# reservations-cpp-experiment
+
+You are an expert in C++20, Couchbase, and airline reservation systems.
+
+## Agent working rules
+
+- **Ask questions** if anything is ambiguous, unclear, or if a business/technical choice is underspecified. Do not invent airline rules or silent defaults when unsure—state assumptions and ask.
+- **Always update `README.md`** when behavior, build steps, APIs, data model, catalog scale, or how to run `load`/`exercise` change. Keep README accurate for the next reader/session.
+
+## Experiment goal
+
+Demonstrate C++ classes backed by **Couchbase 8.x** via **reflect-cpp** (JSON ser/de) as a substitute for a classic **object database** SDK—simulating scale-up UNIX code migrated to scale-out Linux.
+
+Wire contract for seat messages: `schema/airline-reservation.schema.json` (do not change unless asked). Domain C++ types should map to it. Follow `AGENTS.md` for domain/safety; prefer asking over inventing rules.
+
+## Stack
+
+- CMake 3.25+, C++20; reflect-cpp via FetchContent (v0.26.2)
+- libcouchbase for KV; libcurl for management REST (bucket/scope/collections, `memoryQuota`)
+- `.env`: `CB_CONNECTION_STRING`, `CB_USERNAME`, `CB_PASSWORD`; optional `CB_BUCKET`/`CB_SCOPE` (defaults `reservations` / `airline`)
+- Bucket RAM quota = Data Service `memoryQuota` from `GET /pools/default`
+
+## reflect-cpp ↔ Couchbase
+
+- Domain structs in `src/domain/` are the document model.
+- `platform::DocumentStore<T>`: `rfl::json::write` / `read` + libcouchbase get/upsert/insert/replace (CAS).
+- reflect-cpp does **not** speak Couchbase protocol—only JSON mapping (object-database-like “persist this object”).
+
+## Catalog scale
+
+- 10 airlines (`X0`–`X9`) × 28 000 flights/week/airline × 52 weeks = **14 560 000** flights
+- Deterministic flight IDs from global index (`schedule/catalog.hpp`)
+- Oversell **8%**: AU = capacity × 1.08 (physical ≠ sellable bookings)
+- Bookings (class inventory / AU) are separate from physical seat assignment
+
+## Reset epoch (important)
+
+- `load` bumps `catalog_meta.resetEpoch` only—does **not** rewrite millions of docs.
+- Inventory/seatmap docs carry `resetEpoch`. Missing or stale → treat as fully open; lazy upsert on first access.
+- Re-running `load` = advance epoch = all flights open again.
+
+## Binaries
+
+- **`load`**: ensure topology (bucket at max data quota, scope, collections); bump epoch / seed meta.
+- **`exercise`**: **99%** `CheckAvailability` (random catalog flight), **1%** `BookFlight` (ticket buy). Telemetry every 5s. Stop on Ctrl+C or when sold reaches total catalog AU.
+- Seat avail succeeds with **empty seats** when nothing selectable (oversold/full map)—not a hard error. Full AU → omit from bookable set / `FlightFull`.
+
+## Layout (high level)
+
+```
+apps/load, apps/exercise
+src/common, domain, platform (DocumentStore + couchbase_client),
+    schedule (catalog), seatmap (ReservationService, synthetic, seed)
+schema/airline-reservation.schema.json
+```
+
+Collections under `reservations.airline`: `meta`, `inventory`, `seatmaps`, `flights`, `flight_index`, `pnrs`, `holds`, `idempotency`.
+
+## Product semantics (UX analogue)
+
+- Buy ticket = class inventory sell up to AU (may oversell physical seats).
+- Seat map is optional later; empty map when oversold—ticket still valid.
+- Availability is a view; sell uses CAS on inventory/seatmap—races yield unavailable, never silent double-sell.
+
+## Synthetic data
+
+Obviously fake, schema-valid placeholders (see `.cursor/rules/airline-synthetic-data.mdc`). Never real PII/payment data.

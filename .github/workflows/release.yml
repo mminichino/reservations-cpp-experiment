@@ -1,0 +1,130 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and publish Linux zip
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential cmake pkg-config \
+            libcurl4-openssl-dev libfmt-dev \
+            libssl-dev libevent-dev
+
+      - name: Install libcouchbase
+        run: |
+          set -euo pipefail
+          curl -fsSL https://packages.couchbase.com/clients/c/repos/deb/couchbase.key \
+            | sudo gpg --dearmor -o /usr/share/keyrings/couchbase-archive-keyring.gpg
+          # ubuntu2204 packages are used when a dedicated 24.04 suite is unavailable
+          echo "deb [signed-by=/usr/share/keyrings/couchbase-archive-keyring.gpg] https://packages.couchbase.com/clients/c/repos/deb/ubuntu2204 ubuntu2204 main" \
+            | sudo tee /etc/apt/sources.list.d/couchbase-client.list
+          sudo apt-get update
+          sudo apt-get install -y libcouchbase-dev libcouchbase3-libevent
+          pkg-config --modversion libcouchbase
+
+      - name: Configure and build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j"$(nproc)"
+
+      - name: Stage distribution zip
+        id: stage
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          STAGE_NAME="reservations-cpp-experiment-${VERSION}-linux-x86_64"
+          STAGE_DIR="${RUNNER_TEMP}/${STAGE_NAME}"
+          mkdir -p "${STAGE_DIR}/bin"
+
+          # Full project sources (rebuildable on the target host)
+          rsync -a \
+            --exclude '.git/' \
+            --exclude 'build/' \
+            --exclude 'cmake-build-*/' \
+            --exclude '.idea/' \
+            --exclude '.env' \
+            --exclude '.cursor/' \
+            --exclude 'dist/' \
+            --exclude '.github/' \
+            ./ "${STAGE_DIR}/"
+
+          # Pre-built Ubuntu binaries
+          install -m 0755 build/load build/exercise "${STAGE_DIR}/bin/"
+
+          cat > "${STAGE_DIR}/RUN.txt" <<EOF
+          reservations-cpp-experiment ${VERSION} (Linux x86_64)
+
+          Pre-built binaries: ./bin/load  ./bin/exercise
+          Runtime deps: libcouchbase, libcurl, libfmt (see README.md Ubuntu section).
+
+          Quick start:
+            cp .env.example .env   # edit credentials
+            ./bin/load .env
+            ./bin/exercise .env 4
+
+          To rebuild from the bundled sources:
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+            cmake --build build -j"\$(nproc)"
+          EOF
+
+          mkdir -p dist
+          (
+            cd "${RUNNER_TEMP}"
+            zip -r "${GITHUB_WORKSPACE}/dist/${STAGE_NAME}.zip" "${STAGE_NAME}"
+          )
+          cp "dist/${STAGE_NAME}.zip" "dist/reservations-cpp-experiment-latest-linux-x86_64.zip"
+
+          echo "version_zip=dist/${STAGE_NAME}.zip" >> "${GITHUB_OUTPUT}"
+          echo "latest_zip=dist/reservations-cpp-experiment-latest-linux-x86_64.zip" >> "${GITHUB_OUTPUT}"
+          ls -lh dist/
+
+      - name: Create GitHub Release for tag
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            ${{ steps.stage.outputs.version_zip }}
+            ${{ steps.stage.outputs.latest_zip }}
+
+      - name: Point latest tag at this release and refresh latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Movable git tag "latest" → this commit
+          git tag -f latest "${GITHUB_SHA}"
+          git push origin latest --force
+
+          # GitHub Release named "latest" with a stable asset name for scripts
+          if gh release view latest >/dev/null 2>&1; then
+            gh release delete latest --yes --cleanup-tag=false || true
+          fi
+          # Ensure tag still exists after delete (gh may remove release only)
+          git tag -f latest "${GITHUB_SHA}"
+          git push origin latest --force
+
+          gh release create latest \
+            "${{ steps.stage.outputs.latest_zip }}" \
+            --title "Latest (${GITHUB_REF_NAME})" \
+            --notes "Tracks the newest versioned release **${GITHUB_REF_NAME}**. Prefer version tags (e.g. \`${GITHUB_REF_NAME}\`) for reproducible downloads; use this release for a stable asset URL." \
+            --latest=false
