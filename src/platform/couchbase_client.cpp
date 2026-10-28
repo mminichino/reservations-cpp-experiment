@@ -1,13 +1,17 @@
 #include "platform/couchbase_client.hpp"
 
 #include <chrono>
-#include <cstring>
 #include <iostream>
 #include <mutex>
 #include <thread>
+#include <utility>
 
+#include <fmt/format.h>
+
+#include <couchbase/cluster.hxx>
+#include <couchbase/codec/raw_json_transcoder.hxx>
+#include <couchbase/fmt/error.hxx>
 #include <curl/curl.h>
-#include <libcouchbase/couchbase.h>
 
 namespace reservations::platform {
 namespace {
@@ -81,7 +85,6 @@ std::string FormEncode(const std::vector<std::pair<std::string, std::string>>& f
   return out;
 }
 
-/// Parses the Data Service memory quota (MB) from GET /pools/default JSON.
 Result<int> ParseDataMemoryQuotaMb(const std::string& pools_json) {
   const std::string key = "\"memoryQuota\"";
   const auto pos = pools_json.find(key);
@@ -112,10 +115,23 @@ Result<int> ParseDataMemoryQuotaMb(const std::string& pools_json) {
   return Result<int>::Success(value);
 }
 
+Error FromSdkError(const couchbase::error& err, const char* what) {
+  if (err.ec() == couchbase::errc::key_value::document_exists) {
+    return Error::Make(ErrorCode::AlreadyExists, std::string(what) + ": document exists");
+  }
+  if (err.ec() == couchbase::errc::common::cas_mismatch) {
+    return Error::Make(ErrorCode::VersionConflict, std::string(what) + ": CAS mismatch");
+  }
+  if (err.ec() == couchbase::errc::key_value::document_not_found) {
+    return Error::Make(ErrorCode::NotFound, std::string(what) + ": document not found");
+  }
+  return Error::Make(ErrorCode::InternalError, fmt::format("{}: {}", what, err));
+}
+
 }  // namespace
 
 struct CouchbaseClient::Impl {
-  lcb_INSTANCE* instance{nullptr};
+  std::optional<couchbase::cluster> cluster;
   std::mutex mutex;
 };
 
@@ -125,40 +141,20 @@ CouchbaseClient::CouchbaseClient(CouchbaseConfig config)
 CouchbaseClient::~CouchbaseClient() { Close(); }
 
 Result<void> CouchbaseClient::Connect() {
-  lcb_CREATEOPTS* options = nullptr;
-  lcb_createopts_create(&options, LCB_TYPE_CLUSTER);
-  lcb_createopts_connstr(options, config_.connection_string.c_str(), config_.connection_string.size());
-  lcb_createopts_credentials(options, config_.username.c_str(), config_.username.size(),
-                             config_.password.c_str(), config_.password.size());
-
-  lcb_STATUS rc = lcb_create(&impl_->instance, options);
-  lcb_createopts_destroy(options);
-  if (rc != LCB_SUCCESS) {
+  couchbase::cluster_options options(config_.username, config_.password);
+  auto [err, cluster] = couchbase::cluster::connect(config_.connection_string, options).get();
+  if (err) {
     return Result<void>::Failure(
-        Error::Make(ErrorCode::ConnectionError, std::string("lcb_create: ") + lcb_strerror_short(rc)));
+        Error::Make(ErrorCode::ConnectionError, fmt::format("cluster connect: {}", err)));
   }
-
-  rc = lcb_connect(impl_->instance);
-  if (rc != LCB_SUCCESS) {
-    return Result<void>::Failure(
-        Error::Make(ErrorCode::ConnectionError, std::string("lcb_connect: ") + lcb_strerror_short(rc)));
-  }
-  lcb_wait(impl_->instance, LCB_WAIT_DEFAULT);
-
-  rc = lcb_get_bootstrap_status(impl_->instance);
-  if (rc != LCB_SUCCESS) {
-    return Result<void>::Failure(Error::Make(
-        ErrorCode::ConnectionError, std::string("bootstrap failed: ") + lcb_strerror_short(rc)));
-  }
-
-  // Callbacks are installed after they are defined below; see InstallCallbacks helper.
+  impl_->cluster = std::move(cluster);
   return Result<void>::Success();
 }
 
 void CouchbaseClient::Close() {
-  if (impl_ && impl_->instance != nullptr) {
-    lcb_destroy(impl_->instance);
-    impl_->instance = nullptr;
+  if (impl_ && impl_->cluster.has_value()) {
+    impl_->cluster->close().get();
+    impl_->cluster.reset();
   }
 }
 
@@ -166,7 +162,6 @@ Result<void> CouchbaseClient::EnsureTopology(const std::vector<std::string>& col
   curl_global_init(CURL_GLOBAL_DEFAULT);
   const std::string base = "http://" + config_.management_host + ":" + std::to_string(config_.management_port);
 
-  // Data Service memory quota (MB) — use as the bucket RAM quota (maximum for KV).
   const auto pools = HttpRequest("GET", base + "/pools/default", config_.username, config_.password, "", "");
   if (!pools) {
     return Result<void>::Failure(pools.error());
@@ -184,7 +179,6 @@ Result<void> CouchbaseClient::EnsureTopology(const std::vector<std::string>& col
   std::cerr << "Using Data Service memoryQuota=" << ram_quota_mb << " MB for bucket '" << config_.bucket
             << "'\n";
 
-  // Create bucket if missing; otherwise resize to the cluster data quota.
   {
     const auto list = HttpRequest("GET", base + "/pools/default/buckets", config_.username, config_.password, "",
                                   "");
@@ -210,7 +204,6 @@ Result<void> CouchbaseClient::EnsureTopology(const std::vector<std::string>& col
             ErrorCode::InternalError,
             "Create bucket failed (" + std::to_string(created.value().status) + "): " + created.value().body));
       }
-      // Wait for bucket readiness.
       for (int i = 0; i < 30; ++i) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         const auto check = HttpRequest("GET", base + "/pools/default/buckets/" + config_.bucket, config_.username,
@@ -235,7 +228,6 @@ Result<void> CouchbaseClient::EnsureTopology(const std::vector<std::string>& col
     }
   }
 
-  // Create scope if missing.
   {
     const auto scopes = HttpRequest("GET", base + "/pools/default/buckets/" + config_.bucket + "/scopes",
                                     config_.username, config_.password, "", "");
@@ -260,7 +252,6 @@ Result<void> CouchbaseClient::EnsureTopology(const std::vector<std::string>& col
     }
   }
 
-  // Create collections if missing.
   for (const auto& collection : collections) {
     const auto scopes = HttpRequest("GET", base + "/pools/default/buckets/" + config_.bucket + "/scopes",
                                     config_.username, config_.password, "", "");
@@ -292,219 +283,125 @@ Result<void> CouchbaseClient::EnsureTopology(const std::vector<std::string>& col
     return opened;
   }
 
-  // Brief pause so collection manifest propagates to KV nodes.
   std::this_thread::sleep_for(std::chrono::seconds(2));
   return Result<void>::Success();
 }
 
 Result<void> CouchbaseClient::OpenBucket() {
-  lcb_STATUS rc = lcb_open(impl_->instance, config_.bucket.c_str(), config_.bucket.size());
-  if (rc != LCB_SUCCESS) {
-    return Result<void>::Failure(
-        Error::Make(ErrorCode::ConnectionError, std::string("lcb_open: ") + lcb_strerror_short(rc)));
+  if (!impl_->cluster.has_value()) {
+    return Result<void>::Failure(Error::Make(ErrorCode::ConnectionError, "cluster not connected"));
   }
-  lcb_wait(impl_->instance, LCB_WAIT_DEFAULT);
+  // Touch the bucket so the SDK opens it; collection ops will use scope/collection paths.
+  (void)impl_->cluster->bucket(config_.bucket);
   return Result<void>::Success();
 }
 
 namespace {
 
-struct GetCookie {
-  Result<KvResult> result = Result<KvResult>::Failure(Error::Make(ErrorCode::InternalError, "not set"));
-};
-
-void GetCallback(lcb_INSTANCE*, int, const lcb_RESPGET* resp) {
-  GetCookie* cookie = nullptr;
-  lcb_respget_cookie(resp, reinterpret_cast<void**>(&cookie));
-  const lcb_STATUS rc = lcb_respget_status(resp);
-  if (rc == LCB_ERR_DOCUMENT_NOT_FOUND) {
-    KvResult empty;
-    empty.found = false;
-    cookie->result = Result<KvResult>::Success(std::move(empty));
-    return;
-  }
-  if (rc != LCB_SUCCESS) {
-    cookie->result = Result<KvResult>::Failure(
-        Error::Make(ErrorCode::InternalError, std::string("get: ") + lcb_strerror_short(rc)));
-    return;
-  }
-  KvResult out;
-  out.found = true;
-  const char* value = nullptr;
-  std::size_t nvalue = 0;
-  lcb_respget_value(resp, &value, &nvalue);
-  out.value.assign(value, nvalue);
-  lcb_respget_cas(resp, &out.cas);
-  cookie->result = Result<KvResult>::Success(std::move(out));
-}
-
-struct StoreCookie {
-  Result<MutationResult> result =
-      Result<MutationResult>::Failure(Error::Make(ErrorCode::InternalError, "not set"));
-};
-
-void StoreCallback(lcb_INSTANCE*, int, const lcb_RESPSTORE* resp) {
-  StoreCookie* cookie = nullptr;
-  lcb_respstore_cookie(resp, reinterpret_cast<void**>(&cookie));
-  const lcb_STATUS rc = lcb_respstore_status(resp);
-  if (rc == LCB_ERR_DOCUMENT_EXISTS) {
-    cookie->result = Result<MutationResult>::Failure(Error::Make(ErrorCode::AlreadyExists, "document exists"));
-    return;
-  }
-  if (rc == LCB_ERR_CAS_MISMATCH) {
-    cookie->result = Result<MutationResult>::Failure(Error::Make(ErrorCode::VersionConflict, "CAS mismatch"));
-    return;
-  }
-  if (rc != LCB_SUCCESS) {
-    cookie->result = Result<MutationResult>::Failure(
-        Error::Make(ErrorCode::InternalError, std::string("store: ") + lcb_strerror_short(rc)));
-    return;
-  }
-  MutationResult out;
-  lcb_respstore_cas(resp, &out.cas);
-  cookie->result = Result<MutationResult>::Success(out);
-}
-
-struct RemoveCookie {
-  Result<void> result = Result<void>::Failure(Error::Make(ErrorCode::InternalError, "not set"));
-};
-
-void RemoveCallback(lcb_INSTANCE*, int, const lcb_RESPREMOVE* resp) {
-  RemoveCookie* cookie = nullptr;
-  lcb_respremove_cookie(resp, reinterpret_cast<void**>(&cookie));
-  const lcb_STATUS rc = lcb_respremove_status(resp);
-  if (rc == LCB_ERR_DOCUMENT_NOT_FOUND) {
-    cookie->result = Result<void>::Success();
-    return;
-  }
-  if (rc != LCB_SUCCESS) {
-    cookie->result = Result<void>::Failure(
-        Error::Make(ErrorCode::InternalError, std::string("remove: ") + lcb_strerror_short(rc)));
-    return;
-  }
-  cookie->result = Result<void>::Success();
-}
-
-void InstallCallbacks(lcb_INSTANCE* instance) {
-  lcb_install_callback(instance, LCB_CALLBACK_GET, reinterpret_cast<lcb_RESPCALLBACK>(GetCallback));
-  lcb_install_callback(instance, LCB_CALLBACK_STORE, reinterpret_cast<lcb_RESPCALLBACK>(StoreCallback));
-  lcb_install_callback(instance, LCB_CALLBACK_REMOVE, reinterpret_cast<lcb_RESPCALLBACK>(RemoveCallback));
+couchbase::collection CollectionFor(couchbase::cluster& cluster, const CouchbaseConfig& config,
+                                    std::string_view collection) {
+  return cluster.bucket(config.bucket).scope(config.scope).collection(std::string(collection));
 }
 
 }  // namespace
 
 Result<KvResult> CouchbaseClient::Get(std::string_view collection, std::string_view key) {
-  InstallCallbacks(impl_->instance);
   std::scoped_lock lock(impl_->mutex);
-  lcb_CMDGET* cmd = nullptr;
-  lcb_cmdget_create(&cmd);
-  lcb_cmdget_collection(cmd, config_.scope.c_str(), config_.scope.size(), collection.data(), collection.size());
-  lcb_cmdget_key(cmd, key.data(), key.size());
-
-  GetCookie cookie;
-  lcb_STATUS rc = lcb_get(impl_->instance, &cookie, cmd);
-  lcb_cmdget_destroy(cmd);
-  if (rc != LCB_SUCCESS) {
-    return Result<KvResult>::Failure(
-        Error::Make(ErrorCode::InternalError, std::string("lcb_get schedule: ") + lcb_strerror_short(rc)));
+  if (!impl_->cluster.has_value()) {
+    return Result<KvResult>::Failure(Error::Make(ErrorCode::ConnectionError, "cluster not connected"));
   }
-  lcb_wait(impl_->instance, LCB_WAIT_DEFAULT);
-  return std::move(cookie.result);
+  auto coll = CollectionFor(*impl_->cluster, config_, collection);
+  auto [err, result] = coll.get(std::string(key)).get();
+  if (err.ec() == couchbase::errc::key_value::document_not_found) {
+    KvResult empty;
+    empty.found = false;
+    return Result<KvResult>::Success(std::move(empty));
+  }
+  if (err) {
+    return Result<KvResult>::Failure(FromSdkError(err, "get"));
+  }
+  KvResult out;
+  out.found = true;
+  out.value = result.template content_as<std::string, couchbase::codec::raw_json_transcoder>();
+  out.cas = result.cas().value();
+  return Result<KvResult>::Success(std::move(out));
 }
 
 Result<MutationResult> CouchbaseClient::Upsert(std::string_view collection, std::string_view key,
                                                std::string_view value,
                                                std::optional<std::uint32_t> expiry_seconds) {
   std::scoped_lock lock(impl_->mutex);
-  lcb_CMDSTORE* cmd = nullptr;
-  lcb_cmdstore_create(&cmd, LCB_STORE_UPSERT);
-  lcb_cmdstore_collection(cmd, config_.scope.c_str(), config_.scope.size(), collection.data(), collection.size());
-  lcb_cmdstore_key(cmd, key.data(), key.size());
-  lcb_cmdstore_value(cmd, value.data(), value.size());
+  if (!impl_->cluster.has_value()) {
+    return Result<MutationResult>::Failure(Error::Make(ErrorCode::ConnectionError, "cluster not connected"));
+  }
+  auto coll = CollectionFor(*impl_->cluster, config_, collection);
+  auto options = couchbase::upsert_options{};
   if (expiry_seconds.has_value()) {
-    lcb_cmdstore_expiry(cmd, *expiry_seconds);
+    options.expiry(std::chrono::seconds{*expiry_seconds});
   }
-
-  StoreCookie cookie;
-  InstallCallbacks(impl_->instance);
-  lcb_STATUS rc = lcb_store(impl_->instance, &cookie, cmd);
-  lcb_cmdstore_destroy(cmd);
-  if (rc != LCB_SUCCESS) {
-    return Result<MutationResult>::Failure(
-        Error::Make(ErrorCode::InternalError, std::string("lcb_store schedule: ") + lcb_strerror_short(rc)));
+  auto [err, result] =
+      coll.upsert<couchbase::codec::raw_json_transcoder>(std::string(key), std::string(value), options).get();
+  if (err) {
+    return Result<MutationResult>::Failure(FromSdkError(err, "upsert"));
   }
-  lcb_wait(impl_->instance, LCB_WAIT_DEFAULT);
-  return std::move(cookie.result);
+  return Result<MutationResult>::Success(MutationResult{.cas = result.cas().value()});
 }
 
 Result<MutationResult> CouchbaseClient::Insert(std::string_view collection, std::string_view key,
                                                std::string_view value,
                                                std::optional<std::uint32_t> expiry_seconds) {
   std::scoped_lock lock(impl_->mutex);
-  InstallCallbacks(impl_->instance);
-  lcb_CMDSTORE* cmd = nullptr;
-  lcb_cmdstore_create(&cmd, LCB_STORE_INSERT);
-  lcb_cmdstore_collection(cmd, config_.scope.c_str(), config_.scope.size(), collection.data(), collection.size());
-  lcb_cmdstore_key(cmd, key.data(), key.size());
-  lcb_cmdstore_value(cmd, value.data(), value.size());
+  if (!impl_->cluster.has_value()) {
+    return Result<MutationResult>::Failure(Error::Make(ErrorCode::ConnectionError, "cluster not connected"));
+  }
+  auto coll = CollectionFor(*impl_->cluster, config_, collection);
+  auto options = couchbase::insert_options{};
   if (expiry_seconds.has_value()) {
-    lcb_cmdstore_expiry(cmd, *expiry_seconds);
+    options.expiry(std::chrono::seconds{*expiry_seconds});
   }
-
-  StoreCookie cookie;
-  lcb_STATUS rc = lcb_store(impl_->instance, &cookie, cmd);
-  lcb_cmdstore_destroy(cmd);
-  if (rc != LCB_SUCCESS) {
-    return Result<MutationResult>::Failure(
-        Error::Make(ErrorCode::InternalError, std::string("lcb_store schedule: ") + lcb_strerror_short(rc)));
+  auto [err, result] =
+      coll.insert<couchbase::codec::raw_json_transcoder>(std::string(key), std::string(value), options).get();
+  if (err) {
+    return Result<MutationResult>::Failure(FromSdkError(err, "insert"));
   }
-  lcb_wait(impl_->instance, LCB_WAIT_DEFAULT);
-  return std::move(cookie.result);
+  return Result<MutationResult>::Success(MutationResult{.cas = result.cas().value()});
 }
 
 Result<MutationResult> CouchbaseClient::Replace(std::string_view collection, std::string_view key,
                                                 std::string_view value, std::uint64_t cas,
                                                 std::optional<std::uint32_t> expiry_seconds) {
   std::scoped_lock lock(impl_->mutex);
-  InstallCallbacks(impl_->instance);
-  lcb_CMDSTORE* cmd = nullptr;
-  lcb_cmdstore_create(&cmd, LCB_STORE_REPLACE);
-  lcb_cmdstore_collection(cmd, config_.scope.c_str(), config_.scope.size(), collection.data(), collection.size());
-  lcb_cmdstore_key(cmd, key.data(), key.size());
-  lcb_cmdstore_value(cmd, value.data(), value.size());
-  lcb_cmdstore_cas(cmd, cas);
+  if (!impl_->cluster.has_value()) {
+    return Result<MutationResult>::Failure(Error::Make(ErrorCode::ConnectionError, "cluster not connected"));
+  }
+  auto coll = CollectionFor(*impl_->cluster, config_, collection);
+  auto options = couchbase::replace_options{}.cas(couchbase::cas{cas});
   if (expiry_seconds.has_value()) {
-    lcb_cmdstore_expiry(cmd, *expiry_seconds);
+    options.expiry(std::chrono::seconds{*expiry_seconds});
   }
-
-  StoreCookie cookie;
-  lcb_STATUS rc = lcb_store(impl_->instance, &cookie, cmd);
-  lcb_cmdstore_destroy(cmd);
-  if (rc != LCB_SUCCESS) {
-    return Result<MutationResult>::Failure(
-        Error::Make(ErrorCode::InternalError, std::string("lcb_store schedule: ") + lcb_strerror_short(rc)));
+  auto [err, result] =
+      coll.replace<couchbase::codec::raw_json_transcoder>(std::string(key), std::string(value), options).get();
+  if (err) {
+    return Result<MutationResult>::Failure(FromSdkError(err, "replace"));
   }
-  lcb_wait(impl_->instance, LCB_WAIT_DEFAULT);
-  return std::move(cookie.result);
+  return Result<MutationResult>::Success(MutationResult{.cas = result.cas().value()});
 }
 
 Result<void> CouchbaseClient::Remove(std::string_view collection, std::string_view key) {
   std::scoped_lock lock(impl_->mutex);
-  InstallCallbacks(impl_->instance);
-  lcb_CMDREMOVE* cmd = nullptr;
-  lcb_cmdremove_create(&cmd);
-  lcb_cmdremove_collection(cmd, config_.scope.c_str(), config_.scope.size(), collection.data(), collection.size());
-  lcb_cmdremove_key(cmd, key.data(), key.size());
-
-  RemoveCookie cookie;
-  lcb_STATUS rc = lcb_remove(impl_->instance, &cookie, cmd);
-  lcb_cmdremove_destroy(cmd);
-  if (rc != LCB_SUCCESS) {
-    return Result<void>::Failure(
-        Error::Make(ErrorCode::InternalError, std::string("lcb_remove schedule: ") + lcb_strerror_short(rc)));
+  if (!impl_->cluster.has_value()) {
+    return Result<void>::Failure(Error::Make(ErrorCode::ConnectionError, "cluster not connected"));
   }
-  lcb_wait(impl_->instance, LCB_WAIT_DEFAULT);
-  return std::move(cookie.result);
+  auto coll = CollectionFor(*impl_->cluster, config_, collection);
+  auto [err, result] = coll.remove(std::string(key)).get();
+  (void)result;
+  if (err.ec() == couchbase::errc::key_value::document_not_found) {
+    return Result<void>::Success();
+  }
+  if (err) {
+    return Result<void>::Failure(FromSdkError(err, "remove"));
+  }
+  return Result<void>::Success();
 }
 
 }  // namespace reservations::platform

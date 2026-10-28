@@ -21,14 +21,15 @@ Wire contract for seat messages: `schema/airline-reservation.schema.json` (do no
 ## Stack
 
 - CMake 3.25+, C++20; reflect-cpp via FetchContent (v0.26.2)
-- libcouchbase for KV; libcurl for management REST (bucket/scope/collections, `memoryQuota`)
+- couchbase-cxx-client for KV; libcurl for management REST (bucket/scope/collections, `memoryQuota`)
+- Ubuntu 24.04 (noble): install via Couchbase CXX apt repo (`DIST_ARCH=noble/$(uname -m)`); macOS: CPM FetchContent fallback in CMake
 - `.env`: `CB_CONNECTION_STRING`, `CB_USERNAME`, `CB_PASSWORD`; optional `CB_BUCKET`/`CB_SCOPE` (defaults `reservations` / `airline`)
 - Bucket RAM quota = Data Service `memoryQuota` from `GET /pools/default`
 
 ## reflect-cpp ↔ Couchbase
 
 - Domain structs in `src/domain/` are the document model.
-- `platform::DocumentStore<T>`: `rfl::json::write` / `read` + libcouchbase get/upsert/insert/replace (CAS).
+- `platform::DocumentStore<T>`: `rfl::json::write` / `read` + C++ SDK get/upsert/insert/replace (CAS).
 - reflect-cpp does **not** speak Couchbase protocol—only JSON mapping (object-database-like “persist this object”).
 
 ## Catalog scale

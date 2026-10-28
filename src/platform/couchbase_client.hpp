@@ -22,7 +22,7 @@ struct MutationResult {
   std::uint64_t cas{0};
 };
 
-/// Thin libcouchbase wrapper used by reflect-cpp document stores.
+/// Thin Couchbase C++ SDK wrapper used by reflect-cpp document stores.
 /// Thread-safety: externally synchronized — one instance per thread, or protect with a mutex.
 class CouchbaseClient {
  public:

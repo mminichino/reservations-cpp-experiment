@@ -15,7 +15,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install build dependencies
         run: |
@@ -23,19 +23,18 @@ jobs:
           sudo apt-get install -y \
             build-essential cmake pkg-config \
             libcurl4-openssl-dev libfmt-dev \
-            libssl-dev libevent-dev
+            gpg curl
 
-      - name: Install libcouchbase
+      - name: Install Couchbase C++ SDK (noble)
         run: |
           set -euo pipefail
-          curl -fsSL https://packages.couchbase.com/clients/c/repos/deb/couchbase.key \
-            | sudo gpg --dearmor -o /usr/share/keyrings/couchbase-archive-keyring.gpg
-          # ubuntu2204 packages are used when a dedicated 24.04 suite is unavailable
-          echo "deb [signed-by=/usr/share/keyrings/couchbase-archive-keyring.gpg] https://packages.couchbase.com/clients/c/repos/deb/ubuntu2204 ubuntu2204 main" \
-            | sudo tee /etc/apt/sources.list.d/couchbase-client.list
+          DIST_ARCH="$(. /etc/os-release; echo ${VERSION_CODENAME}/$(uname -m))"
+          curl -fsSL "https://packages.couchbase.com/clients/cxx/repos/deb/${DIST_ARCH}/DEB-GPG-KEY.txt" \
+            | sudo gpg --yes --dearmor -o /usr/share/keyrings/couchbase-archive-keyring.gpg
+          sudo curl -fsSL -o /etc/apt/sources.list.d/couchbase-cxx-client.sources \
+            "https://packages.couchbase.com/clients/cxx/repos/deb/${DIST_ARCH}/couchbase-cxx-client.sources"
           sudo apt-get update
-          sudo apt-get install -y libcouchbase-dev libcouchbase3-libevent
-          pkg-config --modversion libcouchbase
+          sudo apt-get install -y couchbase-cxx-client couchbase-cxx-client-dev
 
       - name: Configure and build
         run: |
@@ -51,7 +50,6 @@ jobs:
           STAGE_DIR="${RUNNER_TEMP}/${STAGE_NAME}"
           mkdir -p "${STAGE_DIR}/bin"
 
-          # Full project sources (rebuildable on the target host)
           rsync -a \
             --exclude '.git/' \
             --exclude 'build/' \
@@ -63,14 +61,13 @@ jobs:
             --exclude '.github/' \
             ./ "${STAGE_DIR}/"
 
-          # Pre-built Ubuntu binaries
           install -m 0755 build/load build/exercise "${STAGE_DIR}/bin/"
 
           cat > "${STAGE_DIR}/RUN.txt" <<EOF
           reservations-cpp-experiment ${VERSION} (Linux x86_64)
 
           Pre-built binaries: ./bin/load  ./bin/exercise
-          Runtime deps: libcouchbase, libcurl, libfmt (see README.md Ubuntu section).
+          Runtime deps: couchbase-cxx-client, libcurl, libfmt (see README.md Ubuntu section).
 
           Quick start:
             cp .env.example .env   # edit credentials
@@ -94,7 +91,7 @@ jobs:
           ls -lh dist/
 
       - name: Create GitHub Release for tag
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
@@ -111,15 +108,12 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Movable git tag "latest" → this commit
           git tag -f latest "${GITHUB_SHA}"
           git push origin latest --force
 
-          # GitHub Release named "latest" with a stable asset name for scripts
           if gh release view latest >/dev/null 2>&1; then
             gh release delete latest --yes --cleanup-tag=false || true
           fi
-          # Ensure tag still exists after delete (gh may remove release only)
           git tag -f latest "${GITHUB_SHA}"
           git push origin latest --force
 

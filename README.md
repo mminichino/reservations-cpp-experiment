@@ -18,9 +18,16 @@ curl -fsSL -o reservations-cpp-experiment-linux.zip \
 unzip reservations-cpp-experiment-linux.zip
 cd reservations-cpp-experiment-*-linux-x86_64
 
-# Runtime libraries (Ubuntu 24.04+) — also install libcouchbase per README below
+# Runtime libraries (Ubuntu 24.04 / noble) — Couchbase C++ SDK + curl/fmt
 sudo apt update
-sudo apt install -y libcurl4 libfmt9   # package names may vary slightly by Ubuntu point release
+sudo apt install -y curl gpg
+DIST_ARCH=$(. /etc/os-release; echo ${VERSION_CODENAME}/$(uname -m))
+curl -fsSL "https://packages.couchbase.com/clients/cxx/repos/deb/${DIST_ARCH}/DEB-GPG-KEY.txt" \
+  | sudo gpg --yes --dearmor -o /usr/share/keyrings/couchbase-archive-keyring.gpg
+sudo curl -fsSL -o /etc/apt/sources.list.d/couchbase-cxx-client.sources \
+  "https://packages.couchbase.com/clients/cxx/repos/deb/${DIST_ARCH}/couchbase-cxx-client.sources"
+sudo apt update
+sudo apt install -y couchbase-cxx-client libcurl4 libfmt9
 
 cp .env.example .env   # edit CB_* credentials
 ./bin/load .env
@@ -55,28 +62,35 @@ The [Release](.github/workflows/release.yml) workflow builds on Ubuntu 24.04, up
 
 - CMake **3.25+**
 - A C++20 compiler (Apple Clang / GCC 11+ / Clang 14+)
-- [libcouchbase](https://docs.couchbase.com/c-sdk/current/hello-world/start-using-sdk.html) 3.x
+- [Couchbase C++ SDK](https://docs.couchbase.com/cxx-sdk/current/project-docs/sdk-full-installation.html) (`couchbase-cxx-client`)
 - libcurl, pkg-config, [fmt](https://fmt.dev/)
 - A reachable Couchbase cluster (local or remote)
 
 #### macOS (Homebrew)
 
 ```bash
-brew install cmake libcouchbase curl fmt pkg-config
+brew install cmake curl fmt pkg-config
 ```
 
-#### Ubuntu 24.04+
+CMake will fetch the Couchbase C++ SDK via [CPM.cmake](https://github.com/cpm-cmake/CPM.cmake) when it is not already installed on the system (first configure is slower).
+
+#### Ubuntu 24.04 (noble)
 
 ```bash
 sudo apt update
-sudo apt install -y build-essential cmake pkg-config libcurl4-openssl-dev libfmt-dev
+sudo apt install -y build-essential cmake pkg-config libcurl4-openssl-dev libfmt-dev curl gpg
+
+DIST_ARCH=$(. /etc/os-release; echo ${VERSION_CODENAME}/$(uname -m))
+# e.g. noble/x86_64 or noble/aarch64
+curl -fsSL "https://packages.couchbase.com/clients/cxx/repos/deb/${DIST_ARCH}/DEB-GPG-KEY.txt" \
+  | sudo gpg --yes --dearmor -o /usr/share/keyrings/couchbase-archive-keyring.gpg
+sudo curl -fsSL -o /etc/apt/sources.list.d/couchbase-cxx-client.sources \
+  "https://packages.couchbase.com/clients/cxx/repos/deb/${DIST_ARCH}/couchbase-cxx-client.sources"
+sudo apt update
+sudo apt install -y couchbase-cxx-client couchbase-cxx-client-dev
 ```
 
-Install the Couchbase C SDK (`libcouchbase` / `libcouchbase-dev`) using the [official C SDK installation instructions](https://docs.couchbase.com/c-sdk/current/project-docs/sdk-full-installation.html) for Debian/Ubuntu (APT repo packages are preferred). After install, confirm pkg-config can see it:
-
-```bash
-pkg-config --modversion libcouchbase
-```
+See the [C++ SDK full installation](https://docs.couchbase.com/cxx-sdk/current/project-docs/sdk-full-installation.html) for other Debian/Ubuntu codenames.
 
 ### Configure credentials
 
@@ -154,7 +168,7 @@ Telemetry prints every 5 seconds. Stops on **Ctrl+C**, or when cumulative bookin
 
 ## How reflect-cpp is used with Couchbase
 
-The experiment’s persistence story is: **C++ structs are the document model**; reflect-cpp turns them into JSON; libcouchbase stores and loads that JSON in Couchbase collections.
+The experiment’s persistence story is: **C++ structs are the document model**; reflect-cpp turns them into JSON; the Couchbase C++ SDK stores and loads that JSON in Couchbase collections.
 
 ### Document types as reflected structs
 
@@ -180,7 +194,7 @@ CAS-based `Replace` is how sell/hold paths avoid lost updates under concurrency.
 | Layer | Responsibility |
 |---|---|
 | **reflect-cpp** | Struct ↔ JSON; field naming; enums; `std::optional` / vectors |
-| **libcouchbase** | Connection, KV get/upsert/insert/replace/remove, collections |
+| **couchbase-cxx-client** | Connection, KV get/upsert/insert/replace/remove, collections |
 | **Management REST** | Create bucket/scope/collections; read Data Service `memoryQuota` |
 
 reflect-cpp does not speak the Couchbase protocol. It is the serialization boundary that lets application classes move to JSON documents the same way a classic object database once mapped C++ objects into its store.
@@ -248,7 +262,7 @@ apps/load/          Reset epoch + ensure topology
 apps/exercise/      99/1 availability vs book load test
 src/common/         Result/error model, env, clock, ids
 src/domain/         Reflected document + message types
-src/platform/       libcouchbase client, DocumentStore<T>
+src/platform/       Couchbase C++ SDK client, DocumentStore<T>
 src/schedule/       Catalog scale and deterministic flight ids
 src/seatmap/        ReservationService, synthetic layout, seed
 schema/             airline-reservation.schema.json
