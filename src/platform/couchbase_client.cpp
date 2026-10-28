@@ -7,9 +7,13 @@
 #include <utility>
 
 #include <couchbase/cluster.hxx>
+#include <couchbase/codec/codec_flags.hxx>
+#include <couchbase/codec/encoded_value.hxx>
 #include <couchbase/codec/raw_json_transcoder.hxx>
+#include <couchbase/codec/transcoder_traits.hxx>
 #include <curl/curl.h>
 #include <fmt/format.h>
+#include <system_error>
 
 namespace reservations::platform {
 namespace {
@@ -311,6 +315,29 @@ couchbase::collection CollectionFor(couchbase::cluster& cluster, const Couchbase
 
 }  // namespace
 
+/// Decode JSON bytes regardless of datatype flags (legacy libcouchbase docs often use flags=0).
+struct permissive_json_string_transcoder {
+  template<typename Document, std::enable_if_t<std::is_same_v<Document, std::string>, bool> = true>
+  static auto encode(const Document& document) -> couchbase::codec::encoded_value {
+    return couchbase::codec::raw_json_transcoder::encode<Document>(document);
+  }
+
+  template<typename Document, std::enable_if_t<std::is_same_v<Document, std::string>, bool> = true>
+  static auto decode(const couchbase::codec::encoded_value& encoded) -> Document {
+    return std::string{reinterpret_cast<const char*>(encoded.data.data()), encoded.data.size()};
+  }
+};
+
+}  // namespace reservations::platform
+
+namespace couchbase::codec {
+template<>
+struct is_transcoder<reservations::platform::permissive_json_string_transcoder> : public std::true_type {
+};
+}  // namespace couchbase::codec
+
+namespace reservations::platform {
+
 Result<KvResult> CouchbaseClient::Get(std::string_view collection, std::string_view key) {
   std::scoped_lock lock(impl_->mutex);
   if (!impl_->cluster.has_value()) {
@@ -328,7 +355,12 @@ Result<KvResult> CouchbaseClient::Get(std::string_view collection, std::string_v
   }
   KvResult out;
   out.found = true;
-  out.value = result.template content_as<std::string, couchbase::codec::raw_json_transcoder>();
+  try {
+    out.value = result.template content_as<std::string, permissive_json_string_transcoder>();
+  } catch (const std::system_error& ex) {
+    return Result<KvResult>::Failure(
+        Error::Make(ErrorCode::InternalError, fmt::format("get decode: {}", ex.what())));
+  }
   out.cas = result.cas().value();
   return Result<KvResult>::Success(std::move(out));
 }
