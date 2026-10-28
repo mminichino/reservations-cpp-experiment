@@ -109,14 +109,20 @@ Optional: `CB_BUCKET` (default `reservations`), `CB_SCOPE` (default `airline`).
 
 ### Build
 
-**macOS** (Homebrew prefixes under `/opt/homebrew` on Apple Silicon):
+**macOS** (Homebrew — uses `brew --prefix` for `CMAKE_PREFIX_PATH`):
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH=/opt/homebrew
-cmake --build build -j
+make            # Release → build/load, build/exercise
+make debug      # Debug build
+make clean      # remove build/
 ```
 
-On Intel Macs with Homebrew under `/usr/local`, use `-DCMAKE_PREFIX_PATH=/usr/local` instead.
+Or invoke CMake directly:
+
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+cmake --build build -j
+```
 
 **Ubuntu 24.04+** (system packages; no Homebrew prefix needed):
 
