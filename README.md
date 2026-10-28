@@ -8,13 +8,10 @@ C++ airline reservation experiment that backs domain classes with **Couchbase 8.
 
 Each version tag (for example `v0.1.0`) publishes a GitHub Release with a Linux x86_64 zip (pre-built `load` / `exercise` plus sources). The movable **`latest`** tag/release always points at the newest versioned release and exposes a **stable asset name**.
 
-Replace `OWNER/REPO` with this GitHub repository (for example `my-org/reservations-cpp-experiment`):
-
 ```bash
-# Stable URL via the "latest" release asset name
-curl -fsSL -o reservations-cpp-experiment-linux.zip \
-  "https://github.com/OWNER/REPO/releases/download/latest/reservations-cpp-experiment-latest-linux-x86_64.zip"
-
+curl -OLs https://github.com/mminichino/reservations-cpp-experiment/releases/download/latest/reservations-cpp-experiment-latest-linux-x86_64.zip
+```
+```bash
 unzip reservations-cpp-experiment-linux.zip
 cd reservations-cpp-experiment-*-linux-x86_64
 
@@ -37,13 +34,13 @@ cp .env.example .env   # edit CB_* credentials
 Or with the GitHub CLI:
 
 ```bash
-gh release download latest -R OWNER/REPO \
+gh release download latest -R mminichino/reservations-cpp-experiment \
   -p 'reservations-cpp-experiment-latest-linux-x86_64.zip'
 ```
 
 Pinned/reproducible downloads should use a version tag instead, for example:
 
-`https://github.com/OWNER/REPO/releases/download/v0.1.0/reservations-cpp-experiment-v0.1.0-linux-x86_64.zip`
+`https://github.com/mminichino/reservations-cpp-experiment/releases/download/v0.1.0/reservations-cpp-experiment-v0.1.0-linux-x86_64.zip`
 
 To publish a new release locally after pushing code:
 
