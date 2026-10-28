@@ -6,12 +6,10 @@
 #include <thread>
 #include <utility>
 
-#include <fmt/format.h>
-
 #include <couchbase/cluster.hxx>
 #include <couchbase/codec/raw_json_transcoder.hxx>
-#include <couchbase/fmt/error.hxx>
 #include <curl/curl.h>
+#include <fmt/format.h>
 
 namespace reservations::platform {
 namespace {
@@ -115,6 +113,14 @@ Result<int> ParseDataMemoryQuotaMb(const std::string& pools_json) {
   return Result<int>::Success(value);
 }
 
+std::string FormatSdkError(const couchbase::error& err) {
+  // Avoid couchbase/fmt/error.hxx — on Linux it collides with std::format_to vs fmt::format_to.
+  if (err.message().empty()) {
+    return std::string(err.ec().message());
+  }
+  return fmt::format("{} - {}", err.ec().message(), err.message());
+}
+
 Error FromSdkError(const couchbase::error& err, const char* what) {
   if (err.ec() == couchbase::errc::key_value::document_exists) {
     return Error::Make(ErrorCode::AlreadyExists, std::string(what) + ": document exists");
@@ -125,7 +131,7 @@ Error FromSdkError(const couchbase::error& err, const char* what) {
   if (err.ec() == couchbase::errc::key_value::document_not_found) {
     return Error::Make(ErrorCode::NotFound, std::string(what) + ": document not found");
   }
-  return Error::Make(ErrorCode::InternalError, fmt::format("{}: {}", what, err));
+  return Error::Make(ErrorCode::InternalError, fmt::format("{}: {}", what, FormatSdkError(err)));
 }
 
 }  // namespace
@@ -144,8 +150,8 @@ Result<void> CouchbaseClient::Connect() {
   couchbase::cluster_options options(config_.username, config_.password);
   auto [err, cluster] = couchbase::cluster::connect(config_.connection_string, options).get();
   if (err) {
-    return Result<void>::Failure(
-        Error::Make(ErrorCode::ConnectionError, fmt::format("cluster connect: {}", err)));
+    return Result<void>::Failure(Error::Make(ErrorCode::ConnectionError,
+                                             fmt::format("cluster connect: {}", FormatSdkError(err))));
   }
   impl_->cluster = std::move(cluster);
   return Result<void>::Success();
