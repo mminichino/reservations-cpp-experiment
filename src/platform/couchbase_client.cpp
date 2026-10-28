@@ -168,6 +168,50 @@ void CouchbaseClient::Close() {
   }
 }
 
+Result<void> CouchbaseClient::DropBucket() {
+  curl_global_init(CURL_GLOBAL_DEFAULT);
+  const std::string base = "http://" + config_.management_host + ":" + std::to_string(config_.management_port);
+
+  const auto list =
+      HttpRequest("GET", base + "/pools/default/buckets", config_.username, config_.password, "", "");
+  if (!list) {
+    return Result<void>::Failure(list.error());
+  }
+  const bool exists = list.value().body.find("\"name\":\"" + config_.bucket + "\"") != std::string::npos ||
+                      list.value().body.find("\"name\": \"" + config_.bucket + "\"") != std::string::npos;
+  if (!exists) {
+    return Result<void>::Success();
+  }
+
+  const auto deleted = HttpRequest("DELETE", base + "/pools/default/buckets/" + config_.bucket,
+                                   config_.username, config_.password, "", "");
+  if (!deleted) {
+    return Result<void>::Failure(deleted.error());
+  }
+  if (deleted.value().status >= 300 && deleted.value().status != 404) {
+    return Result<void>::Failure(Error::Make(
+        ErrorCode::InternalError,
+        "Delete bucket failed (" + std::to_string(deleted.value().status) + "): " + deleted.value().body));
+  }
+
+  for (int i = 0; i < 60; ++i) {
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    const auto check =
+        HttpRequest("GET", base + "/pools/default/buckets", config_.username, config_.password, "", "");
+    if (!check) {
+      continue;
+    }
+    const bool still =
+        check.value().body.find("\"name\":\"" + config_.bucket + "\"") != std::string::npos ||
+        check.value().body.find("\"name\": \"" + config_.bucket + "\"") != std::string::npos;
+    if (!still) {
+      return Result<void>::Success();
+    }
+  }
+  return Result<void>::Failure(
+      Error::Make(ErrorCode::InternalError, "Timed out waiting for bucket '" + config_.bucket + "' to disappear"));
+}
+
 Result<void> CouchbaseClient::EnsureTopology(const std::vector<std::string>& collections) {
   curl_global_init(CURL_GLOBAL_DEFAULT);
   const std::string base = "http://" + config_.management_host + ":" + std::to_string(config_.management_port);

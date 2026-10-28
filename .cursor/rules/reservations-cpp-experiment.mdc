@@ -21,7 +21,7 @@ Wire contract for seat messages: `schema/airline-reservation.schema.json` (do no
 ## Stack
 
 - CMake 3.25+, C++20; reflect-cpp via FetchContent (v0.26.2)
-- couchbase-cxx-client for KV; libcurl for management REST (bucket/scope/collections, `memoryQuota`)
+- couchbase-cxx-client for KV; libcurl for management REST (bucket/scope/collections, `memoryQuota`, optional drop)
 - Ubuntu 24.04 (noble): install via Couchbase CXX apt repo (`DIST_ARCH=noble/$(uname -m)`); macOS: CPM FetchContent fallback in CMake
 - `.env`: `CB_CONNECTION_STRING`, `CB_USERNAME`, `CB_PASSWORD`; optional `CB_BUCKET`/`CB_SCOPE` (defaults `reservations` / `airline`)
 - Bucket RAM quota = Data Service `memoryQuota` from `GET /pools/default`
@@ -39,17 +39,17 @@ Wire contract for seat messages: `schema/airline-reservation.schema.json` (do no
 - Oversell **8%**: AU = capacity × 1.08 (physical ≠ sellable bookings)
 - Bookings (class inventory / AU) are separate from physical seat assignment
 
-## Reset epoch (important)
+## Load / materialization (important)
 
-- `load` bumps `catalog_meta.resetEpoch` only—does **not** rewrite millions of docs.
-- Inventory/seatmap docs carry `resetEpoch`. Missing or stale → treat as fully open; lazy upsert on first access.
-- Re-running `load` = advance epoch = all flights open again.
+- **`load`**: ensure topology; bump `catalog_meta.resetEpoch`; **parallel upsert** of inventory + seatmap + flight + `flight_index` for each flight (empty/open). Options: `-j` threads, `-d` drop+recreate bucket, `--subset` / `--start` for partial seeds.
+- Seed is upsert-only with retries; per-thread clients; seatmap template amortized via `thread_local`. Stats every 10s; summary at end.
+- **`exercise`**: avail = Get flight/seatmap only; book = Get inventory + CAS Replace. **No lazy create.** Missing/stale epoch → error (re-run `load`).
 
 ## Binaries
 
-- **`load`**: ensure topology (bucket at max data quota, scope, collections); bump epoch / seed meta.
-- **`exercise`**: **99%** `CheckAvailability` (random catalog flight), **1%** `BookFlight` (ticket buy). Telemetry every 5s. Stop on Ctrl+C or when sold reaches total catalog AU.
-- Seat avail succeeds with **empty seats** when nothing selectable (oversold/full map)—not a hard error. Full AU → omit from bookable set / `FlightFull`.
+- **`load`**: full catalog materialization (long runtime OK for full set).
+- **`exercise`**: **99%** `CheckAvailability` (random catalog flight), **1%** `BookFlight`. Telemetry every 5s. Stop on Ctrl+C or when sold reaches total catalog AU.
+- Seat avail succeeds with **empty seats** when nothing selectable—not a hard error. Full AU → omit from bookable set / `FlightFull`.
 
 ## Layout (high level)
 

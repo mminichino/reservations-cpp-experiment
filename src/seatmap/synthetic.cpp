@@ -156,7 +156,12 @@ SyntheticFlightBundle BuildCatalogFlight(const schedule::FlightRef& ref, std::ui
   bundle.index.flightNumber = bundle.flight.flightNumber;
   bundle.index.departureDate = local_date;
 
-  bundle.seatmap = BuildSeatMapTemplate(flight_id, reset_epoch);
+  // Amortize cabin construction across flights (layout is identical for the catalog).
+  thread_local const domain::SeatMapDocument kSeatTemplate =
+      BuildSeatMapTemplate("00000000-0000-4000-8000-000000000000", 0);
+  bundle.seatmap = kSeatTemplate;
+  bundle.seatmap.flightId = flight_id;
+  bundle.seatmap.resetEpoch = reset_epoch;
 
   const int physical = TemplatePhysicalCapacity();
   bundle.inventory.type = "inventory";

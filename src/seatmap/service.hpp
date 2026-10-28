@@ -29,6 +29,20 @@ inline std::vector<std::string> AllCollections() {
           schedule::kMetaCollection};
 }
 
+[[nodiscard]] inline std::string SeatMapKey(const std::string& flight_id) {
+  return "seatmap::" + flight_id;
+}
+[[nodiscard]] inline std::string FlightKey(const std::string& flight_id) {
+  return "flight::" + flight_id;
+}
+[[nodiscard]] inline std::string InventoryKey(const std::string& flight_id) {
+  return "inv::" + flight_id;
+}
+[[nodiscard]] inline std::string FlightIndexKey(const std::string& airline, const std::string& number,
+                                                const std::string& date) {
+  return "flight_idx::" + airline + "::" + number + "::" + date;
+}
+
 /// Booking (class inventory) and seat-map workflows backed by Couchbase via reflect-cpp.
 /// Thread-safety: externally synchronized through CouchbaseClient.
 class ReservationService {

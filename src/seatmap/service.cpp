@@ -12,15 +12,9 @@
 namespace reservations::seatmap {
 namespace {
 
-std::string SeatMapKey(const std::string& flight_id) { return "seatmap::" + flight_id; }
-std::string FlightKey(const std::string& flight_id) { return "flight::" + flight_id; }
-std::string InventoryKey(const std::string& flight_id) { return "inv::" + flight_id; }
 std::string HoldKey(const std::string& hold_id) { return "hold::" + hold_id; }
 std::string PnrKey(const std::string& locator) { return "pnr::" + locator; }
 std::string IdempotencyKey(const std::string& key) { return "idem::" + key; }
-std::string FlightIndexKey(const std::string& airline, const std::string& number, const std::string& date) {
-  return "flight_idx::" + airline + "::" + number + "::" + date;
-}
 
 std::string RequestFingerprint(const domain::SeatPurchaseRequest& request) {
   std::ostringstream oss;
@@ -81,16 +75,15 @@ ReservationService::ReservationService(platform::CouchbaseClient& client, const 
       flight_index_(client_, kFlightIndexCollection) {}
 
 Result<domain::Flight> ReservationService::FlightFromId(const std::string& flight_id) {
-  unsigned long long idx = 0;
-  if (std::sscanf(flight_id.c_str(), "00000000-0000-4000-8000-%llx", &idx) != 1) {
-    return Result<domain::Flight>::Failure(Error::Make(ErrorCode::FlightNotFound, "Invalid flight id"));
+  auto loaded = flights_.Get(FlightKey(flight_id));
+  if (!loaded) {
+    return Result<domain::Flight>::Failure(loaded.error());
   }
-  if (idx >= schedule::TotalFlights()) {
-    return Result<domain::Flight>::Failure(Error::Make(ErrorCode::FlightNotFound, "Flight out of catalog range"));
+  if (!loaded.value().has_value()) {
+    return Result<domain::Flight>::Failure(
+        Error::Make(ErrorCode::FlightNotFound, "Flight not found — run load to materialize catalog"));
   }
-  const auto ref = schedule::FlightRef::FromGlobalIndex(static_cast<std::uint64_t>(idx));
-  return Result<domain::Flight>::Success(
-      BuildCatalogFlight(ref, catalog_meta_.resetEpoch).flight);
+  return Result<domain::Flight>::Success(std::move(loaded.value()->document));
 }
 
 Result<domain::Flight> ReservationService::ResolveFlight(
@@ -116,17 +109,13 @@ Result<platform::DocumentStore<domain::SeatMapDocument>::Loaded> ReservationServ
   if (!loaded) {
     return Result<platform::DocumentStore<domain::SeatMapDocument>::Loaded>::Failure(loaded.error());
   }
-  const bool stale_or_missing =
-      !loaded.value().has_value() || loaded.value()->document.resetEpoch < catalog_meta_.resetEpoch;
-  if (stale_or_missing) {
-    auto fresh = BuildSeatMapTemplate(flight_id, catalog_meta_.resetEpoch);
-    auto upserted = seatmaps_.Upsert(SeatMapKey(flight_id), fresh);
-    if (!upserted) {
-      return Result<platform::DocumentStore<domain::SeatMapDocument>::Loaded>::Failure(upserted.error());
-    }
-    return Result<platform::DocumentStore<domain::SeatMapDocument>::Loaded>::Success(
-        platform::DocumentStore<domain::SeatMapDocument>::Loaded{.document = std::move(fresh),
-                                                                .cas = upserted.value().cas});
+  if (!loaded.value().has_value()) {
+    return Result<platform::DocumentStore<domain::SeatMapDocument>::Loaded>::Failure(
+        Error::Make(ErrorCode::NotFound, "Seat map missing — run load to materialize catalog"));
+  }
+  if (loaded.value()->document.resetEpoch < catalog_meta_.resetEpoch) {
+    return Result<platform::DocumentStore<domain::SeatMapDocument>::Loaded>::Failure(Error::Make(
+        ErrorCode::NotFound, "Seat map stale vs catalog epoch — re-run load to rematerialize"));
   }
   return Result<platform::DocumentStore<domain::SeatMapDocument>::Loaded>::Success(std::move(*loaded.value()));
 }
@@ -137,30 +126,16 @@ Result<platform::DocumentStore<domain::InventoryDocument>::Loaded> ReservationSe
   if (!loaded) {
     return Result<platform::DocumentStore<domain::InventoryDocument>::Loaded>::Failure(loaded.error());
   }
-  const bool stale_or_missing =
-      !loaded.value().has_value() || loaded.value()->document.resetEpoch < catalog_meta_.resetEpoch;
-  if (stale_or_missing) {
-    domain::InventoryDocument fresh;
-    fresh.type = "inventory";
-    fresh.flightId = flight_id;
-    fresh.physicalCapacity = catalog_meta_.physicalCapacityPerFlight > 0
-                                 ? catalog_meta_.physicalCapacityPerFlight
-                                 : TemplatePhysicalCapacity();
-    fresh.oversellPercent = catalog_meta_.oversellPercent;
-    fresh.authorization = catalog_meta_.authorizationPerFlight > 0
-                              ? catalog_meta_.authorizationPerFlight
-                              : domain::AuthorizationFor(fresh.physicalCapacity, fresh.oversellPercent);
-    fresh.sold = 0;
-    fresh.resetEpoch = catalog_meta_.resetEpoch;
-    auto upserted = inventory_.Upsert(InventoryKey(flight_id), fresh);
-    if (!upserted) {
-      return Result<platform::DocumentStore<domain::InventoryDocument>::Loaded>::Failure(upserted.error());
-    }
-    return Result<platform::DocumentStore<domain::InventoryDocument>::Loaded>::Success(
-        platform::DocumentStore<domain::InventoryDocument>::Loaded{.document = std::move(fresh),
-                                                                   .cas = upserted.value().cas});
+  if (!loaded.value().has_value()) {
+    return Result<platform::DocumentStore<domain::InventoryDocument>::Loaded>::Failure(
+        Error::Make(ErrorCode::NotFound, "Inventory missing — run load to materialize catalog"));
   }
-  return Result<platform::DocumentStore<domain::InventoryDocument>::Loaded>::Success(std::move(*loaded.value()));
+  if (loaded.value()->document.resetEpoch < catalog_meta_.resetEpoch) {
+    return Result<platform::DocumentStore<domain::InventoryDocument>::Loaded>::Failure(Error::Make(
+        ErrorCode::NotFound, "Inventory stale vs catalog epoch — re-run load to rematerialize"));
+  }
+  return Result<platform::DocumentStore<domain::InventoryDocument>::Loaded>::Success(
+      std::move(*loaded.value()));
 }
 
 Result<std::vector<domain::BookableFlight>> ReservationService::ListBookableFlights(

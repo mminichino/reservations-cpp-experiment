@@ -135,18 +135,20 @@ reflect-cpp is fetched automatically via CMake `FetchContent` (pinned to v0.26.2
 
 Binaries:
 
-- `build/load` — reset catalog / ensure topology and seed meta
-- `build/exercise` — availability + booking load test
+- `build/load` — ensure topology, bump epoch, **fully materialize** inventory/seatmap/flight/flight_index
+- `build/exercise` — availability (read) + booking (CAS update) load test
 
 ### Run the experiment
 
-**1. Reset inventory (run before a fresh test)**
+**1. Materialize the catalog (required before `exercise`)**
 
 ```bash
-./build/load .env
+./build/load .env -j 64          # parallel seed (default -j = hardware concurrency)
+./build/load .env -d -j 64       # drop+recreate bucket, then full seed
+./build/load .env --subset 10000 -j 32   # smoke seed only (not enough for full exercise)
 ```
 
-This ensures the `reservations` bucket (RAM quota = cluster Data Service `memoryQuota`), scope, and collections exist, then advances the catalog **reset epoch** so all flights are treated as fully open.
+`load` advances `catalog_meta.resetEpoch`, then upserts per-flight docs for the whole catalog (or `--subset` / `--start` range): empty inventory (`sold=0`), open seatmaps, flight docs, and `flight_index`. Progress lines print every **10s**; a telemetry summary prints when finished. Full catalog seed is large and can take a long time—that is expected.
 
 **2. Exercise the reservation path**
 
@@ -162,8 +164,8 @@ Default threads: `4`. Example:
 
 Workload mix:
 
-- **99%** seat availability checks on a random flight in the 52-week catalog
-- **1%** ticket purchases (`BookFlight` against class inventory / AU)
+- **99%** seat availability checks (KV **Get** only — no lazy create)
+- **1%** ticket purchases (`BookFlight` — inventory **Get** + CAS **Replace**)
 
 Telemetry prints every 5 seconds. Stops on **Ctrl+C**, or when cumulative bookings reach total catalog authorization (AU).
 
@@ -202,9 +204,9 @@ CAS-based `Replace` is how sell/hold paths avoid lost updates under concurrency.
 
 reflect-cpp does not speak the Couchbase protocol. It is the serialization boundary that lets application classes move to JSON documents the same way a classic object database once mapped C++ objects into its store.
 
-### Lazy materialization
+### Catalog materialization
 
-The catalog is large (see below). Flight inventory and seat maps are **not** all written at load time. On first access, if a document is missing or its `resetEpoch` is behind the catalog meta epoch, the service builds a fresh struct in memory, serializes it with reflect-cpp, and upserts it.
+The catalog is large (see below). `load` writes inventory, seatmap, flight, and `flight_index` documents for every flight (or a `--subset`) up front. `exercise` only reads those docs (and CAS-updates inventory on book)—it does not create missing documents.
 
 ---
 
@@ -230,7 +232,7 @@ Flight identity is **deterministic** (UUID-shaped id from a global index), so an
 
 ### Reset epoch
 
-`load` bumps `catalog_meta.resetEpoch`. Inventory and seatmap documents carry their own epoch. Stale or missing docs are treated as **fully open** and rewritten on next use—so a full inventory reset does not require rewriting millions of keys.
+`load` bumps `catalog_meta.resetEpoch`, then rematerializes per-flight docs with that epoch (empty/open). `exercise` requires docs present at the current epoch—missing or stale docs are hard errors (run `load` again). Use `-d` to drop and recreate the bucket for a clean slate.
 
 ### Main APIs (`ReservationService`)
 
@@ -261,8 +263,8 @@ Scope: `airline`
 ### Repository layout
 
 ```
-apps/load/          Reset epoch + ensure topology
-apps/exercise/      99/1 availability vs book load test
+apps/load/          Epoch bump + parallel full materialization (-j, -d, --subset)
+apps/exercise/      99/1 availability (read) vs book (CAS) load test
 src/common/         Result/error model, env, clock, ids
 src/domain/         Reflected document + message types
 src/platform/       Couchbase C++ SDK client, DocumentStore<T>

@@ -40,6 +40,10 @@ class CouchbaseClient {
   /// Creates bucket / scope / collections via the management REST API when missing.
   [[nodiscard]] Result<void> EnsureTopology(const std::vector<std::string>& collections);
 
+  /// Deletes the configured bucket via management REST (no-op if absent). Caller should
+  /// Close() before drop and Connect()+EnsureTopology() afterward to recreate.
+  [[nodiscard]] Result<void> DropBucket();
+
   /// Opens the configured data bucket for KV (after topology exists).
   [[nodiscard]] Result<void> OpenBucket();
 
