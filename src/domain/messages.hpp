@@ -5,6 +5,7 @@
 #include <variant>
 #include <vector>
 
+#include "pricing.hpp"
 #include "types.hpp"
 
 namespace reservations::domain {
@@ -166,4 +167,103 @@ struct ErrorResponse {
   ErrorBody error{};
 };
 
+struct AppliedPriceRecord {
+  Market market{};
+  std::string recordId;
+};
+
+struct DecisionTraceWire {
+  int candidatesEvaluated{0};
+  int candidatesMatched{0};
+  std::optional<std::vector<AppliedPriceRecord>> appliedRecords;
+  std::optional<Money> appliedValue;
+  std::optional<std::string> closedReason;
+};
+
+struct ClassAvailability {
+  std::string bookingClass;
+  CabinClass cabin{CabinClass::economy};
+  ClassStatus status{ClassStatus::closed};
+  int seatsAvailable{0};
+  std::optional<DecisionTraceWire> decisionTrace;
+};
+
+struct JourneySegment {
+  int segmentIndex{0};
+  Flight flight{};
+  std::string boardPoint;
+  std::string offPoint;
+  std::optional<std::vector<ClassAvailability>> classes;
+  std::optional<std::vector<LegInventory>> legs;
+};
+
+struct Journey {
+  std::string journeyId;
+  std::optional<int> connectionCount;
+  std::optional<int> totalDurationMinutes;
+  std::vector<Market> markets;
+  std::vector<JourneySegment> segments;
+  std::vector<ClassAvailability> classes;
+};
+
+struct TravelSlice {
+  std::string origin;
+  std::string destination;
+  std::string departureDate;
+  std::optional<int> daysBefore;
+  std::optional<int> daysAfter;
+};
+
+struct PassengerCount {
+  PassengerType passengerType{PassengerType::adult};
+  int count{1};
+};
+
+struct ClassAvailabilityFilters {
+  std::optional<std::vector<CabinClass>> cabins;
+  std::optional<std::vector<std::string>> bookingClasses;
+  std::optional<std::vector<std::string>> carriers;
+  std::optional<int> maxConnections;
+  std::optional<int> maxJourneysPerSlice;
+};
+
+struct ClassAvailabilityRequest {
+  std::string messageType{"ClassAvailabilityRequest"};
+  std::string requestId;
+  std::vector<TravelSlice> slices;
+  TripType tripType{TripType::one_way};
+  SalesChannel salesChannel{SalesChannel::direct_web};
+  SalesLocation salesLocation{};
+  std::optional<std::string> bookingTime;
+  std::vector<PassengerCount> passengers;
+  std::optional<ClassAvailabilityFilters> filters;
+  std::optional<int> seatCountCap{9};
+  std::optional<std::string> detailLevel{"segment"};  // journey|segment|leg
+  std::optional<bool> explain{false};
+};
+
+struct PriceSnapshotRef {
+  Market market{};
+  std::string snapshotId;
+};
+
+struct SliceResult {
+  int sliceIndex{0};
+  std::string origin;
+  std::string destination;
+  std::string departureDate;
+  std::vector<Journey> journeys;
+  std::optional<bool> journeysTruncated;
+};
+
+struct ClassAvailabilityResponse {
+  std::string messageType{"ClassAvailabilityResponse"};
+  std::string requestId;
+  std::string generatedAt;
+  std::string inventoryAsOf;
+  std::vector<PriceSnapshotRef> priceSnapshots;
+  std::vector<SliceResult> slices;
+};
+
 }  // namespace reservations::domain
+

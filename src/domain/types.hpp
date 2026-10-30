@@ -129,15 +129,46 @@ struct SeatMapDocument {
   std::uint64_t resetEpoch{0};
 };
 
-/// Class / booking inventory (separate from physical seat map). AU may exceed capacity.
+enum class ClassStatus { open, closed, waitlist };
+
+struct CabinCapacity {
+  CabinClass cabin{CabinClass::economy};
+  int physicalCapacity{0};
+  int authorizedCapacity{0};
+  int seatsSold{0};
+  std::optional<Money> bidPrice;
+};
+
+struct ClassControl {
+  std::string bookingClass;  // RBD single letter
+  CabinClass cabin{CabinClass::economy};
+  ClassStatus status{ClassStatus::open};
+  int seatsAvailable{0};
+  int seatsSold{0};
+  int bookingLimit{0};
+  std::optional<int> protection;
+};
+
+struct LegInventory {
+  int legIndex{0};
+  std::string origin;
+  std::string destination;
+  std::optional<std::string> scheduledDeparture;
+  std::optional<std::string> scheduledArrival;
+  std::vector<CabinCapacity> cabins;
+  std::vector<ClassControl> classes;
+};
+
+/// Per-flight inventory: physical seat map is separate; this holds leg/class sell controls.
 struct InventoryDocument {
   std::string type{"inventory"};
   std::string flightId;
-  int physicalCapacity{0};
-  int authorization{0};
-  int sold{0};
+  int physicalCapacity{0};   // sum of cabin physical
+  int authorization{0};      // economy Y bookingLimit (legacy book path)
+  int sold{0};               // economy Y seatsSold (legacy book path)
   double oversellPercent{0.08};
   std::uint64_t resetEpoch{0};
+  std::vector<LegInventory> legs;
 };
 
 /// Industry-typical fixed overbooking rate used when seeding authorization levels.

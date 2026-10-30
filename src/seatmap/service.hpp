@@ -26,7 +26,8 @@ inline constexpr const char* kFlightIndexCollection = "flight_index";
 inline std::vector<std::string> AllCollections() {
   return {kFlightsCollection,     kSeatmapsCollection,      kInventoryCollection, kHoldsCollection,
           kPnrsCollection,        kIdempotencyCollection,   kFlightIndexCollection,
-          schedule::kMetaCollection};
+          schedule::kMetaCollection, schedule::kMarketsCollection, schedule::kPricesCollection,
+          schedule::kOdIndexCollection};
 }
 
 [[nodiscard]] inline std::string SeatMapKey(const std::string& flight_id) {

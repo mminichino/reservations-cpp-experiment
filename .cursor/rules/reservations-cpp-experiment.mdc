@@ -16,58 +16,46 @@ You are an expert in C++20, Couchbase, and airline reservation systems.
 
 Demonstrate C++ classes backed by **Couchbase 8.x** via **reflect-cpp** (JSON ser/de) as a substitute for a classic **object database** SDK—simulating scale-up UNIX code migrated to scale-out Linux.
 
-Wire contract for seat messages: `schema/airline-reservation.schema.json` (do not change unless asked). Domain C++ types should map to it. Follow `AGENTS.md` for domain/safety; prefer asking over inventing rules.
+Wire contract: `schema/airline-reservation.schema.json` (seat APIs **and** O&D `ClassAvailability` / INTERNAL `MarketPriceSet`). Domain C++ types should map to it. Follow `AGENTS.md`; prefer asking over inventing rules.
 
 ## Stack
 
 - CMake 3.25+, C++20; reflect-cpp via FetchContent (v0.26.2)
-- couchbase-cxx-client for KV; libcurl for management REST (bucket/scope/collections, `memoryQuota`, optional drop)
-- Ubuntu 24.04 (noble): install via Couchbase CXX apt repo (`DIST_ARCH=noble/$(uname -m)`); macOS: CPM FetchContent fallback in CMake
-- `.env`: `CB_CONNECTION_STRING`, `CB_USERNAME`, `CB_PASSWORD`; optional `CB_BUCKET`/`CB_SCOPE` (defaults `reservations` / `airline`)
-- Bucket RAM quota = Data Service `memoryQuota` from `GET /pools/default`
+- couchbase-cxx-client for KV; libcurl for management REST
+- Ubuntu 24.04 (noble): CXX apt repo; macOS: CPM fallback
+- `.env`: `CB_CONNECTION_STRING`, `CB_USERNAME`, `CB_PASSWORD`; optional bucket/scope
 
-## reflect-cpp ↔ Couchbase
+## Catalog / network
 
-- Domain structs in `src/domain/` are the document model.
-- `platform::DocumentStore<T>`: `rfl::json::write` / `read` + C++ SDK get/upsert/insert/replace (CAS).
-- reflect-cpp does **not** speak Couchbase protocol—only JSON mapping (object-database-like “persist this object”).
+- **20** real OneWorld + Star Alliance airlines; real airports/hubs/routes in `schedule/network.hpp`
+- 52 weeks; flights indexed by route × week × frequency; deterministic flight UUIDs
+- Markets = directed O&Ds from routes; **2000** synthetic conditional price records/market (paged)
+- Connections: 1-stop via known hubs when shopping
+- Oversell **8%** on cabin authorized capacity / Y booking limit
 
-## Catalog scale
+## Availability engine
 
-- 10 airlines (`X0`–`X9`) × 28 000 flights/week/airline × 52 weeks = **14 560 000** flights
-- Deterministic flight IDs from global index (`schedule/catalog.hpp`)
-- Oversell **8%**: AU = capacity × 1.08 (physical ≠ sellable bookings)
-- Bookings (class inventory / AU) are separate from physical seat assignment
+- Answer is **not stored** — decided per `ClassAvailabilityRequest` from inventory + **full** candidate price set for each market
+- Match conditions (channel, POS, dates, AP, trip/pax type); precedence: higher priority → higher value → lower sequence
+- Open/close vs class controls and cabin bid price; optional `decisionTrace` when `explain`
+- `exercise`: **99%** O&D class shop / **1%** `BookFlight` (Y)
 
-## Load / materialization (important)
+## Load / materialization
 
-- **`load`**: ensure topology; bump `catalog_meta.resetEpoch`; **parallel upsert** of inventory + seatmap + flight + `flight_index` for each flight (empty/open). Options: `-j` threads, `-d` drop+recreate bucket, `--subset` / `--start` for partial seeds.
-- Seed is upsert-only with retries; per-thread clients; seatmap template amortized via `thread_local`. Stats every 10s; summary at end.
-- **`exercise`**: avail = Get flight/seatmap only; book = Get inventory + CAS Replace. **No lazy create.** Missing/stale epoch → error (re-run `load`).
+- `load`: topology; bump epoch; seed market prices; parallel upsert inventory (leg/class), seatmap, flight, indexes, `od_index`
+- Flags: `-j`, `-d` (drop bucket), `--subset` / `--start`
+- Stats every 10s + summary; **no lazy create** in exercise paths
 
-## Binaries
-
-- **`load`**: full catalog materialization (long runtime OK for full set).
-- **`exercise`**: **99%** `CheckAvailability` (random catalog flight), **1%** `BookFlight`. Telemetry every 5s. Stop on Ctrl+C or when sold reaches total catalog AU.
-- Seat avail succeeds with **empty seats** when nothing selectable—not a hard error. Full AU → omit from bookable set / `FlightFull`.
-
-## Layout (high level)
+## Layout
 
 ```
 apps/load, apps/exercise
-src/common, domain, platform (DocumentStore + couchbase_client),
-    schedule (catalog), seatmap (ReservationService, synthetic, seed)
+src/common, domain, platform, schedule, pricing, availability, seatmap
 schema/airline-reservation.schema.json
 ```
 
-Collections under `reservations.airline`: `meta`, `inventory`, `seatmaps`, `flights`, `flight_index`, `pnrs`, `holds`, `idempotency`.
-
-## Product semantics (UX analogue)
-
-- Buy ticket = class inventory sell up to AU (may oversell physical seats).
-- Seat map is optional later; empty map when oversold—ticket still valid.
-- Availability is a view; sell uses CAS on inventory/seatmap—races yield unavailable, never silent double-sell.
+Collections: `meta`, `markets`, `prices`, `od_index`, `inventory`, `seatmaps`, `flights`, `flight_index`, `pnrs`, `holds`, `idempotency`.
 
 ## Synthetic data
 
-Obviously fake, schema-valid placeholders (see `.cursor/rules/airline-synthetic-data.mdc`). Never real PII/payment data.
+Obviously fake PII/payment; airlines/airports/routes are real. See `.cursor/rules/airline-synthetic-data.mdc`.

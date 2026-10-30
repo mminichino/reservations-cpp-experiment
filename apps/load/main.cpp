@@ -20,8 +20,8 @@ void PrintUsage(const char* argv0) {
             << "  -d         drop and recreate the bucket before seeding\n"
             << "  --subset N materialize only N flights (from --start; smoke/CI)\n"
             << "  --start I  global flight index to begin at (default: 0)\n"
-            << "\nMaterializes inventory, seatmap, flight, and flight_index for each flight.\n"
-            << "exercise expects a full catalog seed (omit --subset) before running.\n";
+            << "\nMaterializes market prices, then inventory/seatmap/flight/flight_index/od_index\n"
+            << "for OneWorld+Star alliance routes. exercise expects a full catalog seed.\n";
 }
 
 }  // namespace
@@ -115,10 +115,11 @@ int main(int argc, char** argv) {
   const std::uint64_t catalog = reservations::schedule::TotalFlights();
   const std::uint64_t count = subset == 0 ? (catalog > start_index ? catalog - start_index : 0) : subset;
 
-  std::cout << "Loading catalog (epoch bump + full materialization)...\n"
-            << "  airlines=" << reservations::schedule::kAirlineCount
-            << " flights/week/airline=" << reservations::schedule::kFlightsPerWeekPerAirline
-            << " weeks=" << reservations::schedule::kWeeksOut << " catalog_flights=" << catalog << '\n'
+  std::cout << "Loading catalog (epoch bump + O&D prices + full materialization)...\n"
+            << "  airlines=" << reservations::schedule::AirlineCount()
+            << " routes=" << reservations::schedule::RouteCount()
+            << " weeks=" << reservations::schedule::kWeeksOut << " catalog_flights=" << catalog
+            << " price_records/market=" << reservations::schedule::kPriceRecordsPerMarket << '\n'
             << "  seed_start=" << start_index << " seed_count=" << count << " threads=" << threads
             << (drop_bucket ? " drop_bucket=yes" : "") << '\n';
 
@@ -131,9 +132,10 @@ int main(int argc, char** argv) {
   const auto& m = meta.value();
   const std::uint64_t total_au = catalog * static_cast<std::uint64_t>(m.authorizationPerFlight);
 
-  std::cout << "  reset_epoch=" << m.resetEpoch << " physical_capacity/flight=" << m.physicalCapacityPerFlight
+  std::cout << "  reset_epoch=" << m.resetEpoch << " snapshot=" << m.priceSnapshotId
+            << " physical_capacity/flight=" << m.physicalCapacityPerFlight
             << " AU/flight=" << m.authorizationPerFlight << " total_AU=" << total_au << '\n'
-            << "Materializing inventory + seatmap + flight + flight_index (stats every 10s)...\n";
+            << "Materializing markets/prices then flights (stats every 10s)...\n";
 
   // Release bootstrap client before workers open their own connections.
   client.Close();

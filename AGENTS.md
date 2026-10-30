@@ -4,7 +4,9 @@ Instructions for AI coding agents (Cursor and others) working in this repository
 
 When these instructions conflict with a user request, say so and ask before proceeding. When they are silent, choose the safer, more explicit option.
 
-The wire-level contract for seat lookup and purchase is `airline-reservation.schema.json`. Do not change it without being asked. Domain types in C++ must map to it one to one.
+The wire-level contract is `schema/airline-reservation.schema.json` (seat map hold/purchase **and** O&D `ClassAvailability` / INTERNAL `MarketPriceSet` for conditional prices). Do not change it without being asked. Domain types in C++ must map to it one to one.
+
+Class availability is decided per request: load the **complete** candidate price set for each market on the journey, match conditions, apply precedence, then weigh the winning value against seat controls. Never open/close a class from a partial price set.
 
 ---
 
@@ -30,9 +32,10 @@ Use industry terms. Do not invent synonyms ("booking", "order", "reservation") f
 | **Booking class (RBD)** | Single-letter reservation booking designator (Y, B, M, J, ...) that determines which inventory bucket is decremented. | Not the same as cabin, and not the same as fare basis. Never conflate them. |
 | **Cabin** | Physical compartment: first, business, premium economy, economy. | Maps to `CabinClass` in the schema. |
 | **Inventory** | Per flight-date: physical capacity, authorization levels, and per-class seats sold, with nested or bid-price controls from revenue management. | The source of truth for sellable counts. |
-| **Availability** | A *view* of inventory, possibly cached, returned to shoppers. | May be stale. It is never authoritative; the sell step re-checks inventory. |
+| **Availability** | A *view* computed for a shop request (O&D class availability), not a stored answer. | Inventory may be slightly stale; the sell step re-checks. |
+| **Market / price record** | O&D-keyed conditional values used to value a sale (INTERNAL; not customer fares). | Conditions span channel, POS, travel/booking dates, AP, trip/pax type; overlapping records need precedence. |
 | **Seat map / seat inventory** | Per-seat state for assignment: available, held, occupied, blocked. | Separate from class inventory. Selling a class seat does not assign a physical seat. |
-| **Fare / fare basis / fare rules** | Price product and its conditions (advance purchase, min/max stay, change and refund rules). | Filed and distributed externally; versioned with effective dates. |
+| **Fare / fare basis / fare rules** | Customer-facing price product and rules (distinct from INTERNAL market price records). | Filed and distributed externally; versioned with effective dates. |
 | **Ticket / e-ticket / coupon** | Document of carriage (13-digit ticket number); one coupon per flown segment. | Coupon status (open, checked-in, flown, refunded, exchanged) is a state machine. |
 | **SSR / OSI** | Special service request (meal, wheelchair, infant) and other service information. | SSRs are airline-actionable and carry status codes of their own. |
 | **TTL** | Ticketing time limit. If the PNR is not ticketed by then, the system cancels it. | Enforced by a scheduler, never by a client. |

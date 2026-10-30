@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://example.com/schemas/airline-reservation.schema.json",
   "title": "Airline Reservation System",
-  "description": "Message and data structures for looking up seat availability on a flight, holding seats, and purchasing a seat. The root accepts any one of the message types defined in $defs.",
+  "description": "Message and data structures for looking up seat availability on a flight, holding seats, and purchasing a seat; for class availability across an origin and destination; and for the conditional price data the availability engine evaluates. The root accepts any one of the message types defined in $defs. Structures marked INTERNAL in their description are for the availability engine and authorized callers only.",
   "oneOf": [
     { "$ref": "#/$defs/SeatAvailabilityRequest" },
     { "$ref": "#/$defs/SeatAvailabilityResponse" },
@@ -10,6 +10,10 @@
     { "$ref": "#/$defs/SeatHoldResponse" },
     { "$ref": "#/$defs/SeatPurchaseRequest" },
     { "$ref": "#/$defs/SeatPurchaseResponse" },
+    { "$ref": "#/$defs/ClassAvailabilityRequest" },
+    { "$ref": "#/$defs/ClassAvailabilityResponse" },
+    { "$ref": "#/$defs/MarketPriceSetRequest" },
+    { "$ref": "#/$defs/MarketPriceSetResponse" },
     { "$ref": "#/$defs/ErrorResponse" }
   ],
 
@@ -740,7 +744,11 @@
             "PAYMENT_ACTION_REQUIRED",
             "DUPLICATE_REQUEST",
             "RATE_LIMITED",
-            "INTERNAL_ERROR"
+            "INTERNAL_ERROR",
+            "MARKET_NOT_FOUND",
+            "PRICE_SET_INCOMPLETE",
+            "SNAPSHOT_EXPIRED",
+            "INVALID_PAGE_TOKEN"
           ]
         },
         "message": { "type": "string" },
@@ -772,6 +780,678 @@
         "error": { "$ref": "#/$defs/Error" }
       },
       "required": ["messageType", "error"],
+      "additionalProperties": false
+    },
+
+    "BookingClass": {
+      "type": "string",
+      "pattern": "^[A-Z]$",
+      "description": "Single-letter reservation booking designator (RBD), e.g. Y. Selects the inventory bucket that is decremented. Not the same as cabin or fare basis."
+    },
+
+    "Market": {
+      "type": "object",
+      "description": "An origin and destination pair (airport or city codes). Prices are keyed by market; a connecting journey spans several markets.",
+      "properties": {
+        "origin": { "$ref": "#/$defs/AirportCode" },
+        "destination": { "$ref": "#/$defs/AirportCode" }
+      },
+      "required": ["origin", "destination"],
+      "additionalProperties": false
+    },
+
+    "SalesChannel": {
+      "type": "string",
+      "enum": ["direct_web", "direct_mobile", "call_center", "airport", "travel_agency", "corporate", "ndc_api", "ota", "kiosk"],
+      "description": "Distribution channel through which the sale happens. Extend by adding values; never repurpose existing ones."
+    },
+
+    "TripType": {
+      "type": "string",
+      "enum": ["one_way", "round_trip", "open_jaw", "circle_trip"]
+    },
+
+    "DayOfWeek": {
+      "type": "string",
+      "enum": ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+    },
+
+    "SalesLocation": {
+      "type": "object",
+      "description": "Where a sale is made. Country is always known; the finer levels are present when the channel has them.",
+      "properties": {
+        "country": { "$ref": "#/$defs/CountryCode" },
+        "city": {
+          "$ref": "#/$defs/AirportCode",
+          "description": "IATA city or metropolitan code of the point of sale (often coincides with a primary airport code, e.g. NYC, LON, TYO). Not necessarily an operating airport."
+        },
+        "officeId": { "type": "string", "pattern": "^[A-Z0-9]{1,12}$", "description": "Airline or GDS office identifier." },
+        "agencyId": { "type": "string", "pattern": "^[0-9]{7,8}$", "description": "IATA agency number." }
+      },
+      "required": ["country"],
+      "additionalProperties": false
+    },
+
+    "DateRange": {
+      "type": "object",
+      "description": "Inclusive range of local dates. Either bound may be omitted for an open-ended range, but not both.",
+      "properties": {
+        "from": { "$ref": "#/$defs/LocalDate" },
+        "to": { "$ref": "#/$defs/LocalDate" }
+      },
+      "anyOf": [
+        { "required": ["from"] },
+        { "required": ["to"] }
+      ],
+      "additionalProperties": false
+    },
+
+    "IntRange": {
+      "type": "object",
+      "description": "Inclusive range of non-negative integers. Either bound may be omitted for an open-ended range, but not both.",
+      "properties": {
+        "min": { "type": "integer", "minimum": 0 },
+        "max": { "type": "integer", "minimum": 0 }
+      },
+      "anyOf": [
+        { "required": ["min"] },
+        { "required": ["max"] }
+      ],
+      "additionalProperties": false
+    },
+
+    "LocationPattern": {
+      "type": "object",
+      "description": "One location a price condition can match at a given level of the sales hierarchy.",
+      "properties": {
+        "level": { "type": "string", "enum": ["region", "country", "city", "office", "agency"] },
+        "code": {
+          "type": "string",
+          "pattern": "^[A-Z0-9_*-]{1,24}$",
+          "description": "Code at that level. An asterisk matches any run of characters, e.g. HOU* matches every office id starting with HOU."
+        }
+      },
+      "required": ["level", "code"],
+      "additionalProperties": false
+    },
+
+    "ChannelCondition": {
+      "type": "object",
+      "description": "Matches when the sales channel is in include (or include is absent) and not in exclude.",
+      "properties": {
+        "include": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/SalesChannel" } },
+        "exclude": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/SalesChannel" } }
+      },
+      "minProperties": 1,
+      "additionalProperties": false
+    },
+
+    "LocationCondition": {
+      "type": "object",
+      "description": "Matches when the point of sale matches any include pattern (or include is absent) and no exclude pattern.",
+      "properties": {
+        "include": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/LocationPattern" } },
+        "exclude": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/LocationPattern" } }
+      },
+      "minProperties": 1,
+      "additionalProperties": false
+    },
+
+    "DateRangeCondition": {
+      "type": "object",
+      "description": "Matches when the date falls in any include range (or include is absent) and in no exclude range.",
+      "properties": {
+        "include": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/DateRange" } },
+        "exclude": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/DateRange" } }
+      },
+      "minProperties": 1,
+      "additionalProperties": false
+    },
+
+    "DayOfWeekCondition": {
+      "type": "object",
+      "description": "Matches when the day of week is in include (or include is absent) and not in exclude.",
+      "properties": {
+        "include": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/DayOfWeek" } },
+        "exclude": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/DayOfWeek" } }
+      },
+      "minProperties": 1,
+      "additionalProperties": false
+    },
+
+    "AdvancePurchaseCondition": {
+      "type": "object",
+      "description": "Matches on the number of whole days between the booking date and the first departure date.",
+      "properties": {
+        "include": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/IntRange" } },
+        "exclude": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/IntRange" } }
+      },
+      "minProperties": 1,
+      "additionalProperties": false
+    },
+
+    "TripTypeCondition": {
+      "type": "object",
+      "description": "Matches when the trip type is in include (or include is absent) and not in exclude.",
+      "properties": {
+        "include": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/TripType" } },
+        "exclude": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/TripType" } }
+      },
+      "minProperties": 1,
+      "additionalProperties": false
+    },
+
+    "PassengerTypeCondition": {
+      "type": "object",
+      "description": "Matches when the passenger type is in include (or include is absent) and not in exclude.",
+      "properties": {
+        "include": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/PassengerType" } },
+        "exclude": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/PassengerType" } }
+      },
+      "minProperties": 1,
+      "additionalProperties": false
+    },
+
+    "AdditionalDimensionCondition": {
+      "type": "object",
+      "description": "Airline-specific condition dimension not modelled above (for example a corporate account or fare family). The meaning of name and values is defined by the airline's configuration, not by this schema.",
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z][a-zA-Z0-9_]{0,31}$" },
+        "include": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "maxLength": 64 } },
+        "exclude": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "string", "maxLength": 64 } }
+      },
+      "required": ["name"],
+      "anyOf": [
+        { "required": ["include"] },
+        { "required": ["exclude"] }
+      ],
+      "additionalProperties": false
+    },
+
+    "PriceConditions": {
+      "type": "object",
+      "description": "Conditions that decide when a price record may be used. Dimensions are independent and combined with AND. A dimension that is absent is a wildcard. Within a dimension a value matches when it is in some include entry (or include is absent) and in no exclude entry. Different records can match the same request; precedence between them is decided by the engine, not by this schema.",
+      "properties": {
+        "salesChannels": { "$ref": "#/$defs/ChannelCondition" },
+        "salesLocations": { "$ref": "#/$defs/LocationCondition" },
+        "travelDates": { "$ref": "#/$defs/DateRangeCondition", "description": "Departure date of the first slice of the journey." },
+        "returnTravelDates": { "$ref": "#/$defs/DateRangeCondition", "description": "Departure date of the return slice, for round trips." },
+        "bookingDates": { "$ref": "#/$defs/DateRangeCondition", "description": "Date on which the sale is made." },
+        "departureDaysOfWeek": { "$ref": "#/$defs/DayOfWeekCondition", "description": "Day of week of the first departure." },
+        "advancePurchaseDays": { "$ref": "#/$defs/AdvancePurchaseCondition" },
+        "tripTypes": { "$ref": "#/$defs/TripTypeCondition" },
+        "passengerTypes": { "$ref": "#/$defs/PassengerTypeCondition" },
+        "additionalDimensions": {
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/AdditionalDimensionCondition" }
+        }
+      },
+      "additionalProperties": false
+    },
+
+    "PriceRecord": {
+      "type": "object",
+      "description": "A value plus the conditions under which it may be used. INTERNAL: used by the availability engine to value a sale against seat controls. Never shown to the customer.",
+      "properties": {
+        "recordId": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Stable identifier, unique across the price data." },
+        "carrier": { "$ref": "#/$defs/AirlineCode" },
+        "bookingClass": { "$ref": "#/$defs/BookingClass" },
+        "cabin": { "$ref": "#/$defs/CabinClass" },
+        "fareBasis": { "type": "string", "pattern": "^[A-Z0-9]{1,15}$" },
+        "value": { "$ref": "#/$defs/Money", "description": "Value used to value the sale." },
+        "priority": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "Input to precedence. Default rule: higher priority wins; if equal, higher value.amountMinor wins; if still equal, lower sequence wins (source order). The engine may replace this with airline-specific rules."
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Source order, used as the final tie-breaker so precedence is deterministic when priority and value tie."
+        },
+        "effective": { "$ref": "#/$defs/DateRange", "description": "Period during which the record itself is in force. Distinct from the bookingDates and travelDates conditions." },
+        "conditions": { "$ref": "#/$defs/PriceConditions" },
+        "attributes": {
+          "type": "object",
+          "maxProperties": 32,
+          "description": "Airline-specific data carried with the record that is not a condition.",
+          "additionalProperties": { "type": ["string", "number", "boolean"] }
+        }
+      },
+      "required": ["recordId", "carrier", "bookingClass", "value", "priority", "conditions"],
+      "additionalProperties": false
+    },
+
+    "PricingContext": {
+      "type": "object",
+      "description": "The facts about one request that price conditions are tested against. Derived facts (advance purchase days, departure day of week) are computed by the engine from these fields.",
+      "properties": {
+        "salesChannel": { "$ref": "#/$defs/SalesChannel" },
+        "salesLocation": { "$ref": "#/$defs/SalesLocation" },
+        "bookingDate": { "$ref": "#/$defs/LocalDate" },
+        "tripType": { "$ref": "#/$defs/TripType" },
+        "passengerType": { "$ref": "#/$defs/PassengerType" },
+        "outboundDepartureDate": { "$ref": "#/$defs/LocalDate" },
+        "returnDepartureDate": { "$ref": "#/$defs/LocalDate" }
+      },
+      "required": ["salesChannel", "salesLocation", "bookingDate", "tripType", "passengerType", "outboundDepartureDate"],
+      "additionalProperties": false
+    },
+
+    "ClassStatus": {
+      "type": "string",
+      "enum": ["open", "closed", "waitlist"],
+      "description": "open: can be sold. closed: cannot be sold. waitlist: can be requested but not confirmed."
+    },
+
+    "DecisionTrace": {
+      "type": "object",
+      "description": "INTERNAL, returned only when the request sets explain. Shows how a class was opened or closed. Contains price values, so it must only be returned to authorized callers.",
+      "properties": {
+        "candidatesEvaluated": { "type": "integer", "minimum": 0, "description": "Price records tested against the request." },
+        "candidatesMatched": { "type": "integer", "minimum": 0, "description": "Price records whose conditions matched." },
+        "appliedRecords": {
+          "type": "array",
+          "description": "Records that won precedence, one per market on the journey.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "market": { "$ref": "#/$defs/Market" },
+              "recordId": { "type": "string", "minLength": 1, "maxLength": 64 }
+            },
+            "required": ["market", "recordId"],
+            "additionalProperties": false
+          }
+        },
+        "appliedValue": { "$ref": "#/$defs/Money" },
+        "closedReason": {
+          "type": "string",
+          "enum": ["no_seats", "closed_by_control", "value_below_bid_price", "no_applicable_price", "class_not_offered"]
+        }
+      },
+      "required": ["candidatesEvaluated", "candidatesMatched"],
+      "additionalProperties": false
+    },
+
+    "ClassAvailability": {
+      "type": "object",
+      "description": "Whether one booking class can be sold and how many seats remain, capped at the request's seatCountCap.",
+      "properties": {
+        "bookingClass": { "$ref": "#/$defs/BookingClass" },
+        "cabin": { "$ref": "#/$defs/CabinClass" },
+        "status": { "$ref": "#/$defs/ClassStatus" },
+        "seatsAvailable": { "type": "integer", "minimum": 0 },
+        "decisionTrace": { "$ref": "#/$defs/DecisionTrace" }
+      },
+      "required": ["bookingClass", "cabin", "status", "seatsAvailable"],
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "const": "open" } }, "required": ["status"] },
+          "then": { "properties": { "seatsAvailable": { "minimum": 1 } } },
+          "else": { "properties": { "seatsAvailable": { "const": 0 } } }
+        }
+      ],
+      "additionalProperties": false
+    },
+
+    "CabinCapacity": {
+      "type": "object",
+      "description": "INTERNAL. Capacity and controls of one cabin on one leg.",
+      "properties": {
+        "cabin": { "$ref": "#/$defs/CabinClass" },
+        "physicalCapacity": { "type": "integer", "minimum": 0 },
+        "authorizedCapacity": { "type": "integer", "minimum": 0, "description": "Capacity authorized for sale, which may exceed physical capacity by deliberate overbooking policy." },
+        "seatsSold": { "type": "integer", "minimum": 0 },
+        "bidPrice": { "$ref": "#/$defs/Money", "description": "Minimum value a sale must bring for the cabin to be open to it." }
+      },
+      "required": ["cabin", "physicalCapacity", "authorizedCapacity", "seatsSold"],
+      "additionalProperties": false
+    },
+
+    "ClassControl": {
+      "type": "object",
+      "description": "INTERNAL. Seat counts and controls of one booking class on one leg. Counts are real, not capped.",
+      "properties": {
+        "bookingClass": { "$ref": "#/$defs/BookingClass" },
+        "cabin": { "$ref": "#/$defs/CabinClass" },
+        "status": { "$ref": "#/$defs/ClassStatus" },
+        "seatsAvailable": { "type": "integer", "minimum": 0 },
+        "seatsSold": { "type": "integer", "minimum": 0 },
+        "bookingLimit": { "type": "integer", "minimum": 0, "description": "Maximum seats that may be sold in this class." },
+        "protection": { "type": "integer", "minimum": 0, "description": "Seats held back for higher classes." }
+      },
+      "required": ["bookingClass", "cabin", "status", "seatsAvailable", "seatsSold", "bookingLimit"],
+      "additionalProperties": false
+    },
+
+    "LegInventory": {
+      "type": "object",
+      "description": "INTERNAL. Inventory of one leg (a takeoff and landing) of a flight. A flight can have several legs.",
+      "properties": {
+        "legIndex": { "type": "integer", "minimum": 0 },
+        "origin": { "$ref": "#/$defs/AirportCode" },
+        "destination": { "$ref": "#/$defs/AirportCode" },
+        "scheduledDeparture": { "$ref": "#/$defs/DateTime" },
+        "scheduledArrival": { "$ref": "#/$defs/DateTime" },
+        "cabins": { "type": "array", "items": { "$ref": "#/$defs/CabinCapacity" } },
+        "classes": { "type": "array", "items": { "$ref": "#/$defs/ClassControl" } }
+      },
+      "required": ["legIndex", "origin", "destination", "cabins", "classes"],
+      "additionalProperties": false
+    },
+
+    "JourneySegment": {
+      "type": "object",
+      "description": "One flight used by a journey, between the board and off points (which can be a part of a multi-leg flight).",
+      "properties": {
+        "segmentIndex": { "type": "integer", "minimum": 0 },
+        "flight": { "$ref": "#/$defs/Flight" },
+        "boardPoint": { "$ref": "#/$defs/AirportCode" },
+        "offPoint": { "$ref": "#/$defs/AirportCode" },
+        "classes": {
+          "type": "array",
+          "description": "Per-class availability for this flight. Present when detailLevel is segment or leg.",
+          "items": { "$ref": "#/$defs/ClassAvailability" }
+        },
+        "legs": {
+          "type": "array",
+          "description": "INTERNAL. Leg inventory and controls. Present only when detailLevel is leg.",
+          "items": { "$ref": "#/$defs/LegInventory" }
+        }
+      },
+      "required": ["segmentIndex", "flight", "boardPoint", "offPoint"],
+      "additionalProperties": false
+    },
+
+    "Journey": {
+      "type": "object",
+      "description": "One way of getting from origin to destination: a direct flight or a connection.",
+      "properties": {
+        "journeyId": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Unique within the response." },
+        "connectionCount": { "type": "integer", "minimum": 0, "maximum": 3 },
+        "totalDurationMinutes": { "type": "integer", "minimum": 1 },
+        "markets": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Markets whose prices were used to value this journey. A connecting journey can involve several.",
+          "items": { "$ref": "#/$defs/Market" }
+        },
+        "segments": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/JourneySegment" } },
+        "classes": {
+          "type": "array",
+          "description": "End-to-end result: which booking classes can be sold for the whole journey and how many seats remain.",
+          "items": { "$ref": "#/$defs/ClassAvailability" }
+        }
+      },
+      "required": ["journeyId", "markets", "segments", "classes"],
+      "additionalProperties": false
+    },
+
+    "ClassAvailabilityRequest": {
+      "type": "object",
+      "title": "ClassAvailabilityRequest",
+      "description": "Asks which booking classes can be sold, and how many seats remain, for an origin and destination on given dates, sold through a given channel and location. The answer is decided per request from current inventory and the price records that apply; it is not stored. Not to be confused with SeatAvailabilityRequest, which returns the seat map of one flight.",
+      "properties": {
+        "messageType": { "const": "ClassAvailabilityRequest" },
+        "requestId": { "$ref": "#/$defs/Uuid" },
+        "slices": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 6,
+          "description": "Directions of travel. One for a one-way trip, two for a round trip or open jaw, three or more for a circle trip.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "origin": { "$ref": "#/$defs/AirportCode" },
+              "destination": { "$ref": "#/$defs/AirportCode" },
+              "departureDate": { "$ref": "#/$defs/LocalDate", "description": "Local date at the origin airport." },
+              "dateWindow": {
+                "type": "object",
+                "description": "Also search this many days around departureDate.",
+                "properties": {
+                  "daysBefore": { "type": "integer", "minimum": 0, "maximum": 7, "default": 0 },
+                  "daysAfter": { "type": "integer", "minimum": 0, "maximum": 7, "default": 0 }
+                },
+                "additionalProperties": false
+              }
+            },
+            "required": ["origin", "destination", "departureDate"],
+            "additionalProperties": false
+          }
+        },
+        "tripType": { "$ref": "#/$defs/TripType" },
+        "salesChannel": { "$ref": "#/$defs/SalesChannel" },
+        "salesLocation": { "$ref": "#/$defs/SalesLocation" },
+        "bookingTime": {
+          "$ref": "#/$defs/DateTime",
+          "description": "Time of sale that booking-date and advance-purchase conditions are tested against. Defaults to server time. Set it to replay or test a past decision."
+        },
+        "passengers": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "description": "Passenger counts by type. The seats needed are the total of all counts except infants in lap, and must not exceed 9.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "passengerType": { "$ref": "#/$defs/PassengerType" },
+              "count": { "type": "integer", "minimum": 1, "maximum": 9 }
+            },
+            "required": ["passengerType", "count"],
+            "additionalProperties": false
+          }
+        },
+        "filters": {
+          "type": "object",
+          "properties": {
+            "cabins": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/CabinClass" } },
+            "bookingClasses": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/BookingClass" } },
+            "carriers": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/AirlineCode" } },
+            "maxConnections": { "type": "integer", "minimum": 0, "maximum": 3, "default": 2, "description": "0 means nonstop and direct flights only." },
+            "maxJourneysPerSlice": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 200 }
+          },
+          "additionalProperties": false
+        },
+        "seatCountCap": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 99,
+          "default": 9,
+          "description": "Reported seat counts are capped at this value, so 9 means nine or more."
+        },
+        "detailLevel": {
+          "type": "string",
+          "enum": ["journey", "segment", "leg"],
+          "default": "segment",
+          "description": "journey: end-to-end classes only. segment: adds per-flight classes. leg: adds internal leg inventory and controls, for authorized callers only."
+        },
+        "explain": {
+          "type": "boolean",
+          "default": false,
+          "description": "Return a decisionTrace with each class. Internal callers only, because it exposes price values."
+        }
+      },
+      "required": ["messageType", "requestId", "slices", "tripType", "salesChannel", "salesLocation", "passengers"],
+      "allOf": [
+        {
+          "if": { "properties": { "tripType": { "const": "one_way" } }, "required": ["tripType"] },
+          "then": { "properties": { "slices": { "maxItems": 1 } } }
+        },
+        {
+          "if": { "properties": { "tripType": { "enum": ["round_trip", "open_jaw"] } }, "required": ["tripType"] },
+          "then": { "properties": { "slices": { "minItems": 2, "maxItems": 2 } } }
+        },
+        {
+          "if": { "properties": { "tripType": { "const": "circle_trip" } }, "required": ["tripType"] },
+          "then": { "properties": { "slices": { "minItems": 3 } } }
+        }
+      ],
+      "additionalProperties": false
+    },
+
+    "ClassAvailabilityResponse": {
+      "type": "object",
+      "title": "ClassAvailabilityResponse",
+      "properties": {
+        "messageType": { "const": "ClassAvailabilityResponse" },
+        "requestId": { "$ref": "#/$defs/Uuid" },
+        "generatedAt": { "$ref": "#/$defs/DateTime" },
+        "inventoryAsOf": { "$ref": "#/$defs/DateTime", "description": "Time of the inventory the decision was made from." },
+        "priceSnapshots": {
+          "type": "array",
+          "description": "Which snapshot of the price data was used for each market, so a decision can be reproduced and audited.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "market": { "$ref": "#/$defs/Market" },
+              "snapshotId": { "type": "string", "minLength": 1, "maxLength": 128 }
+            },
+            "required": ["market", "snapshotId"],
+            "additionalProperties": false
+          }
+        },
+        "slices": {
+          "type": "array",
+          "description": "One entry per requested slice and departure date. A slice with a dateWindow produces several entries with the same sliceIndex.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "sliceIndex": { "type": "integer", "minimum": 0, "description": "Position of the slice in the request." },
+              "origin": { "$ref": "#/$defs/AirportCode" },
+              "destination": { "$ref": "#/$defs/AirportCode" },
+              "departureDate": { "$ref": "#/$defs/LocalDate" },
+              "journeys": { "type": "array", "items": { "$ref": "#/$defs/Journey" } },
+              "journeysTruncated": { "type": "boolean", "default": false, "description": "True when maxJourneysPerSlice cut the list." }
+            },
+            "required": ["sliceIndex", "origin", "destination", "departureDate", "journeys"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["messageType", "requestId", "generatedAt", "inventoryAsOf", "priceSnapshots", "slices"],
+      "additionalProperties": false
+    },
+
+    "MarketPriceSetRequest": {
+      "type": "object",
+      "title": "MarketPriceSetRequest",
+      "description": "INTERNAL. Asks for the price records of one or more markets, so the availability engine can test each candidate against a request. The result can be large (several MiB per market), so it is returned in pages that all belong to one snapshot. Reading only part of the set can open or close a class incorrectly, so callers must read every page before using the data.",
+      "properties": {
+        "messageType": { "const": "MarketPriceSetRequest" },
+        "requestId": { "$ref": "#/$defs/Uuid" },
+        "markets": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "description": "A connecting journey can involve several markets.",
+          "items": { "$ref": "#/$defs/Market" }
+        },
+        "scope": {
+          "type": "string",
+          "enum": ["full_market", "candidates_for_context"],
+          "default": "full_market",
+          "description": "full_market returns every record in the market. candidates_for_context lets the server drop records that cannot match any of the given contexts; it must never drop a record that could match."
+        },
+        "contexts": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "description": "Required when scope is candidates_for_context. A record is returned if it could match any context.",
+          "items": { "$ref": "#/$defs/PricingContext" }
+        },
+        "carriers": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/AirlineCode" } },
+        "bookingClasses": { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "#/$defs/BookingClass" } },
+        "pageSize": { "type": "integer", "minimum": 100, "maximum": 10000, "default": 5000, "description": "Maximum records per page." },
+        "pageToken": { "type": "string", "minLength": 1, "maxLength": 2048, "description": "nextPageToken from the previous page. Pins the request to the same snapshot." },
+        "ifSnapshotId": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Snapshot the caller already holds. If it is still current the response is notModified and carries no records." }
+      },
+      "required": ["messageType", "requestId", "markets"],
+      "allOf": [
+        {
+          "if": { "properties": { "scope": { "const": "candidates_for_context" } }, "required": ["scope"] },
+          "then": { "required": ["contexts"] }
+        }
+      ],
+      "additionalProperties": false
+    },
+
+    "MarketPriceSetResponse": {
+      "type": "object",
+      "title": "MarketPriceSetResponse",
+      "description": "INTERNAL. One page of a price set. All pages of one set share a snapshotId. The set is complete only when the last page has been read and the record counts match marketTotals.",
+      "properties": {
+        "messageType": { "const": "MarketPriceSetResponse" },
+        "requestId": { "$ref": "#/$defs/Uuid" },
+        "generatedAt": { "$ref": "#/$defs/DateTime" },
+        "snapshotId": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Identifies the exact version of the price data. Identical across all pages of one set." },
+        "scope": { "type": "string", "enum": ["full_market", "candidates_for_context"], "description": "Scope actually applied." },
+        "notModified": { "type": "boolean", "default": false, "description": "True when ifSnapshotId is still current. No records are returned." },
+        "page": {
+          "type": "object",
+          "properties": {
+            "pageNumber": { "type": "integer", "minimum": 1 },
+            "pageCount": { "type": "integer", "minimum": 1 },
+            "recordCount": { "type": "integer", "minimum": 0, "description": "Records on this page." },
+            "totalRecords": { "type": "integer", "minimum": 0, "description": "Records in the whole set, across all pages and markets." },
+            "isLastPage": { "type": "boolean" },
+            "nextPageToken": { "type": "string", "minLength": 1, "maxLength": 2048, "description": "Present unless this is the last page." }
+          },
+          "required": ["pageNumber", "pageCount", "recordCount", "totalRecords", "isLastPage"],
+          "additionalProperties": false
+        },
+        "marketTotals": {
+          "type": "array",
+          "description": "Records per market in the whole set. The caller checks what it received against these before using the data.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "market": { "$ref": "#/$defs/Market" },
+              "totalRecords": { "type": "integer", "minimum": 0 }
+            },
+            "required": ["market", "totalRecords"],
+            "additionalProperties": false
+          }
+        },
+        "markets": {
+          "type": "array",
+          "description": "Records on this page, grouped by market.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "market": { "$ref": "#/$defs/Market" },
+              "records": { "type": "array", "items": { "$ref": "#/$defs/PriceRecord" } }
+            },
+            "required": ["market", "records"],
+            "additionalProperties": false
+          }
+        },
+        "snapshotChecksum": {
+          "type": "object",
+          "description": "Checksum of the whole set, present on the last page, so the caller can verify it holds every record.",
+          "properties": {
+            "algorithm": { "const": "sha256" },
+            "value": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+          },
+          "required": ["algorithm", "value"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["messageType", "requestId", "generatedAt", "snapshotId", "scope"],
+      "allOf": [
+        {
+          "if": { "properties": { "notModified": { "const": true } }, "required": ["notModified"] },
+          "else": { "required": ["page", "marketTotals", "markets"] }
+        },
+        {
+          "if": {
+            "properties": { "page": { "properties": { "isLastPage": { "const": false } }, "required": ["isLastPage"] } },
+            "required": ["page"]
+          },
+          "then": { "properties": { "page": { "required": ["nextPageToken"] } } }
+        }
+      ],
       "additionalProperties": false
     }
   }

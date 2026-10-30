@@ -59,6 +59,8 @@ add_library(reservations_core
   src/seatmap/service.cpp
   src/seatmap/synthetic.cpp
   src/seatmap/seed.cpp
+  src/pricing/engine.cpp
+  src/availability/service.cpp
 )
 add_library(reservations::core ALIAS reservations_core)
 

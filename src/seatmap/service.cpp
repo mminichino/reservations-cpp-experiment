@@ -215,6 +215,26 @@ Result<domain::FlightBookingResponse> ReservationService::BookFlight(
     }
 
     inventory.sold += qty;
+    const std::string rbd = request.fareClass.value_or("Y");
+    if (!inventory.legs.empty()) {
+      for (auto& cls : inventory.legs.front().classes) {
+        if (cls.bookingClass == rbd) {
+          cls.seatsSold += qty;
+          cls.seatsAvailable = std::max(0, cls.bookingLimit - cls.seatsSold);
+          if (cls.seatsAvailable == 0) {
+            cls.status = domain::ClassStatus::closed;
+          }
+          break;
+        }
+      }
+      for (auto& cabin : inventory.legs.front().cabins) {
+        if (cabin.cabin == domain::CabinClass::economy && (rbd == "Y" || rbd == "B" || rbd == "M" || rbd == "H" ||
+                                                          rbd == "Q" || rbd == "V" || rbd == "L")) {
+          cabin.seatsSold += qty;
+          break;
+        }
+      }
+    }
     auto replaced = inventory_.Replace(InventoryKey(request.flightId), inventory, inv.value().cas);
     if (!replaced) {
       if (replaced.error().code == ErrorCode::VersionConflict) {
