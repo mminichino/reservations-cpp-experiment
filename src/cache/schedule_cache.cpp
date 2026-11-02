@@ -21,6 +21,12 @@ std::uint64_t OdPayloadBytes(const std::string& key, const std::vector<std::stri
 
 }  // namespace
 
+void ScheduleCache::PinSnapshot(platform::DataSnapshotDocument snapshot) {
+  std::lock_guard lock(mu_);
+  snapshot_ = std::move(snapshot);
+  pinned_ = true;
+}
+
 platform::DataSnapshotDocument ScheduleCache::CurrentSnapshot() const {
   std::lock_guard lock(mu_);
   return snapshot_;
@@ -31,34 +37,19 @@ std::uint64_t ScheduleCache::ApproxBytes() const {
   return approx_bytes_;
 }
 
-Result<platform::DataSnapshotDocument> ScheduleCache::FetchSnapshot(platform::CouchbaseClient& client) {
-  platform::DocumentStore<platform::DataSnapshotDocument> store(client, schedule::kMetaCollection);
-  auto loaded = store.Get(platform::kScheduleSnapshotKey);
-  if (!loaded) {
-    return Result<platform::DataSnapshotDocument>::Failure(loaded.error());
-  }
-  if (!loaded.value().has_value()) {
-    return Result<platform::DataSnapshotDocument>::Failure(
-        Error::Make(ErrorCode::NotFound, "schedule snapshot missing — run load"));
-  }
-  return Result<platform::DataSnapshotDocument>::Success(std::move(loaded.value()->document));
-}
-
 Result<std::shared_ptr<const std::vector<std::string>>> ScheduleCache::GetDirectFlights(
     platform::CouchbaseClient& client, std::string_view origin, std::string_view destination,
     std::string_view departure_date, std::uint64_t reset_epoch) {
-  auto snap = FetchSnapshot(client);
-  if (!snap) {
-    return Result<std::shared_ptr<const std::vector<std::string>>>::Failure(snap.error());
-  }
   const std::string key = schedule::OdDateIndexKey(origin, destination, departure_date);
-  const std::string snap_id = snap.value().snapshotId;
 
   {
     std::lock_guard lock(mu_);
-    snapshot_ = snap.value();
+    if (!pinned_) {
+      return Result<std::shared_ptr<const std::vector<std::string>>>::Failure(
+          Error::Make(ErrorCode::ValidationFailed, "schedule snapshot not pinned"));
+    }
     auto it = od_.find(key);
-    if (it != od_.end() && it->second.snapshot_id == snap_id && it->second.value) {
+    if (it != od_.end() && it->second.value) {
       return Result<std::shared_ptr<const std::vector<std::string>>>::Success(it->second.value);
     }
   }
@@ -76,20 +67,11 @@ Result<std::shared_ptr<const std::vector<std::string>>> ScheduleCache::GetDirect
   const std::uint64_t payload = OdPayloadBytes(key, *ptr);
   {
     std::lock_guard lock(mu_);
-    snapshot_ = snap.value();
-    for (auto it = od_.begin(); it != od_.end();) {
-      if (it->second.snapshot_id != snap_id) {
-        approx_bytes_ -= it->second.bytes;
-        it = od_.erase(it);
-      } else {
-        ++it;
-      }
-    }
     auto existing = od_.find(key);
     if (existing != od_.end()) {
       approx_bytes_ -= existing->second.bytes;
     }
-    od_[key] = Entry<std::vector<std::string>>{.snapshot_id = snap_id, .value = ptr, .bytes = payload};
+    od_[key] = Entry<std::vector<std::string>>{.value = ptr, .bytes = payload};
     approx_bytes_ += payload;
   }
   return Result<std::shared_ptr<const std::vector<std::string>>>::Success(std::move(ptr));
@@ -97,18 +79,16 @@ Result<std::shared_ptr<const std::vector<std::string>>> ScheduleCache::GetDirect
 
 Result<std::shared_ptr<const domain::Flight>> ScheduleCache::GetFlight(platform::CouchbaseClient& client,
                                                                        std::string_view flight_id) {
-  auto snap = FetchSnapshot(client);
-  if (!snap) {
-    return Result<std::shared_ptr<const domain::Flight>>::Failure(snap.error());
-  }
   const std::string id(flight_id);
-  const std::string snap_id = snap.value().snapshotId;
 
   {
     std::lock_guard lock(mu_);
-    snapshot_ = snap.value();
+    if (!pinned_) {
+      return Result<std::shared_ptr<const domain::Flight>>::Failure(
+          Error::Make(ErrorCode::ValidationFailed, "schedule snapshot not pinned"));
+    }
     auto it = flights_.find(id);
-    if (it != flights_.end() && it->second.snapshot_id == snap_id && it->second.value) {
+    if (it != flights_.end() && it->second.value) {
       return Result<std::shared_ptr<const domain::Flight>>::Success(it->second.value);
     }
   }
@@ -126,20 +106,11 @@ Result<std::shared_ptr<const domain::Flight>> ScheduleCache::GetFlight(platform:
   const std::uint64_t payload = rfl::json::write(*ptr).size() + id.size();
   {
     std::lock_guard lock(mu_);
-    snapshot_ = snap.value();
-    for (auto it = flights_.begin(); it != flights_.end();) {
-      if (it->second.snapshot_id != snap_id) {
-        approx_bytes_ -= it->second.bytes;
-        it = flights_.erase(it);
-      } else {
-        ++it;
-      }
-    }
     auto existing = flights_.find(id);
     if (existing != flights_.end()) {
       approx_bytes_ -= existing->second.bytes;
     }
-    flights_[id] = Entry<domain::Flight>{.snapshot_id = snap_id, .value = ptr, .bytes = payload};
+    flights_[id] = Entry<domain::Flight>{.value = ptr, .bytes = payload};
     approx_bytes_ += payload;
   }
   return Result<std::shared_ptr<const domain::Flight>>::Success(std::move(ptr));

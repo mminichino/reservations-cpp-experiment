@@ -28,7 +28,7 @@ sudo apt install -y couchbase-cxx-client libcurl4 libfmt9
 
 cp .env.example .env   # edit CB_* credentials
 ./bin/load .env
-./bin/exercise .env 4
+./bin/exercise .env 4       # optional: add -C for client caches
 ```
 
 Or with the GitHub CLI:
@@ -153,13 +153,14 @@ Binaries:
 **2. Exercise the reservation path**
 
 ```bash
-./build/exercise .env [threads]
+./build/exercise .env [threads] [-C]
 ```
 
-Default threads: `4`. Example:
+Default threads: `4`. Default is **pure KV** (no local cache). Pass `-C` to enable the shared process-wide client caches (price/schedule snapshot ids pinned for the run).
 
 ```bash
-./build/exercise .env 32
+./build/exercise .env 32       # KV baseline
+./build/exercise .env 32 -C    # with caches
 ```
 
 Workload mix:
@@ -237,15 +238,15 @@ Flight identity is **deterministic** (UUID-shaped id from route/week/frequency i
 
 ### Client caches (`src/cache/`)
 
-One **process-wide** `ClientCaches` shared by all exercise workers (mutexes + inventory fence):
+Optional via `exercise -C` (default off = pure KV / reflect-cpp). When enabled, one **process-wide** `ClientCaches` is shared by all workers. Price/schedule snapshot ids are **pinned** from `catalog_meta` at start (experiment treats that data as static — no per-call snapshot Gets).
 
-| Cache | Currency | Behavior |
-|---|---|---|
-| `PriceSetCache` | `Get snapshot::prices` | Serve market price set if snapshotId matches; else refill from paged `prices` |
-| `ScheduleCache` | `Get snapshot::schedule` | OD index + flight docs keyed by schedule snapshotId |
-| `InventoryCache` | per-flight fence + `resetEpoch` | Readers wait for fence (~100ms then KV); hit if fresh else fill; `BookFlight` fences, KV Get+CAS, write-through `Put` |
+| Cache | Behavior |
+|---|---|
+| `PriceSetCache` | Cache full market price sets; fill from paged `prices` on miss |
+| `ScheduleCache` | Cache OD index + flight docs on miss |
+| `InventoryCache` | Per-flight fence + write-through; readers wait for fence; `BookFlight` = Fence → GetForUpdate → CAS → Put |
 
-`exercise` stats add `cache` (approx resident size) and `avg_get` (mean found-document payload over the interval). Booking remains CAS-authoritative under the shared fence.
+Stats columns `cache` / `avg_get` always print (`cache` is `0B` without `-C`).
 
 ### Main APIs (`ReservationService`)
 
@@ -279,7 +280,7 @@ Scope: `airline`
 
 ```
 apps/load/          Epoch + market prices + parallel flight materialization + snapshots
-apps/exercise/      99% ClassAvailability O&D / 1% BookFlight (per-worker caches)
+apps/exercise/      99% ClassAvailability O&D / 1% BookFlight (`-C` optional shared cache)
 src/common/         Result/error model, env, clock, ids
 src/domain/         Reflected document + message + pricing types
 src/platform/       Couchbase C++ SDK client, DocumentStore<T>, snapshot helpers

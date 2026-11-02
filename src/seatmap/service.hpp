@@ -50,8 +50,9 @@ inline std::vector<std::string> AllCollections() {
 /// Thread-safety: externally synchronized through CouchbaseClient.
 class ReservationService {
  public:
+  /// Pass nullptr caches for pure KV path; non-null enables schedule/inventory caches + book fence.
   ReservationService(platform::CouchbaseClient& client, const Clock& clock,
-                     std::shared_ptr<cache::ClientCaches> caches);
+                     std::shared_ptr<cache::ClientCaches> caches = nullptr);
 
   void SetCatalogMeta(schedule::CatalogMeta meta) { catalog_meta_ = std::move(meta); }
   [[nodiscard]] const schedule::CatalogMeta& catalog_meta() const { return catalog_meta_; }

@@ -11,6 +11,12 @@
 
 namespace reservations::cache {
 
+void PriceSetCache::PinSnapshot(platform::DataSnapshotDocument snapshot) {
+  std::lock_guard lock(mu_);
+  snapshot_ = std::move(snapshot);
+  pinned_ = true;
+}
+
 platform::DataSnapshotDocument PriceSetCache::CurrentSnapshot() const {
   std::lock_guard lock(mu_);
   return snapshot_;
@@ -21,22 +27,9 @@ std::uint64_t PriceSetCache::ApproxBytes() const {
   return approx_bytes_;
 }
 
-Result<platform::DataSnapshotDocument> PriceSetCache::FetchSnapshot(platform::CouchbaseClient& client) {
-  platform::DocumentStore<platform::DataSnapshotDocument> store(client, schedule::kMetaCollection);
-  auto loaded = store.Get(platform::kPriceSnapshotKey);
-  if (!loaded) {
-    return Result<platform::DataSnapshotDocument>::Failure(loaded.error());
-  }
-  if (!loaded.value().has_value()) {
-    return Result<platform::DataSnapshotDocument>::Failure(
-        Error::Make(ErrorCode::NotFound, "price snapshot missing — run load"));
-  }
-  return Result<platform::DataSnapshotDocument>::Success(std::move(loaded.value()->document));
-}
-
-Result<std::vector<domain::PriceRecord>> PriceSetCache::LoadFromKv(
-    platform::CouchbaseClient& client, std::string_view origin, std::string_view destination,
-    [[maybe_unused]] std::string_view snapshot_id) {
+Result<std::vector<domain::PriceRecord>> PriceSetCache::LoadFromKv(platform::CouchbaseClient& client,
+                                                                   std::string_view origin,
+                                                                   std::string_view destination) {
   platform::DocumentStore<domain::MarketMetaDocument> meta_store(client, schedule::kMarketsCollection);
   const std::string meta_key = "market_meta::" + schedule::MarketKey(origin, destination);
   auto meta = meta_store.Get(meta_key);
@@ -68,23 +61,21 @@ Result<std::vector<domain::PriceRecord>> PriceSetCache::LoadFromKv(
 
 Result<std::shared_ptr<const std::vector<domain::PriceRecord>>> PriceSetCache::GetMarketPrices(
     platform::CouchbaseClient& client, std::string_view origin, std::string_view destination) {
-  auto snap = FetchSnapshot(client);
-  if (!snap) {
-    return Result<std::shared_ptr<const std::vector<domain::PriceRecord>>>::Failure(snap.error());
-  }
   const std::string market = schedule::MarketKey(origin, destination);
-  const std::string snap_id = snap.value().snapshotId;
 
   {
     std::lock_guard lock(mu_);
-    snapshot_ = snap.value();
+    if (!pinned_) {
+      return Result<std::shared_ptr<const std::vector<domain::PriceRecord>>>::Failure(
+          Error::Make(ErrorCode::ValidationFailed, "price snapshot not pinned"));
+    }
     auto it = by_market_.find(market);
-    if (it != by_market_.end() && it->second.snapshot_id == snap_id && it->second.records) {
+    if (it != by_market_.end() && it->second.records) {
       return Result<std::shared_ptr<const std::vector<domain::PriceRecord>>>::Success(it->second.records);
     }
   }
 
-  auto loaded = LoadFromKv(client, origin, destination, snap_id);
+  auto loaded = LoadFromKv(client, origin, destination);
   if (!loaded) {
     return Result<std::shared_ptr<const std::vector<domain::PriceRecord>>>::Failure(loaded.error());
   }
@@ -92,20 +83,11 @@ Result<std::shared_ptr<const std::vector<domain::PriceRecord>>> PriceSetCache::G
   const std::uint64_t payload = rfl::json::write(*ptr).size() + market.size();
   {
     std::lock_guard lock(mu_);
-    snapshot_ = snap.value();
-    for (auto it = by_market_.begin(); it != by_market_.end();) {
-      if (it->second.snapshot_id != snap_id) {
-        approx_bytes_ -= it->second.bytes;
-        it = by_market_.erase(it);
-      } else {
-        ++it;
-      }
-    }
     auto existing = by_market_.find(market);
     if (existing != by_market_.end()) {
       approx_bytes_ -= existing->second.bytes;
     }
-    by_market_[market] = MarketEntry{.snapshot_id = snap_id, .records = ptr, .bytes = payload};
+    by_market_[market] = MarketEntry{.records = ptr, .bytes = payload};
     approx_bytes_ += payload;
   }
   return Result<std::shared_ptr<const std::vector<domain::PriceRecord>>>::Success(std::move(ptr));

@@ -15,10 +15,12 @@
 
 namespace reservations::cache {
 
-/// Process-local OD-index and flight cache keyed by schedule snapshotId.
-/// Currency checked via tiny Get of `snapshot::schedule`.
+/// Process-local OD-index and flight cache.
+/// Snapshot id is pinned once (experiment treats schedule data as static) — no per-call KV currency check.
 class ScheduleCache {
  public:
+  void PinSnapshot(platform::DataSnapshotDocument snapshot);
+
   [[nodiscard]] Result<std::shared_ptr<const std::vector<std::string>>> GetDirectFlights(
       platform::CouchbaseClient& client, std::string_view origin, std::string_view destination,
       std::string_view departure_date, std::uint64_t reset_epoch);
@@ -31,17 +33,15 @@ class ScheduleCache {
   [[nodiscard]] std::uint64_t ApproxBytes() const;
 
  private:
-  [[nodiscard]] Result<platform::DataSnapshotDocument> FetchSnapshot(platform::CouchbaseClient& client);
-
   template <typename T>
   struct Entry {
-    std::string snapshot_id;
     std::shared_ptr<const T> value;
     std::uint64_t bytes{0};
   };
 
   mutable std::mutex mu_;
   platform::DataSnapshotDocument snapshot_{};
+  bool pinned_{false};
   std::uint64_t approx_bytes_{0};
   std::unordered_map<std::string, Entry<std::vector<std::string>>> od_;
   std::unordered_map<std::string, Entry<domain::Flight>> flights_;

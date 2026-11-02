@@ -74,18 +74,25 @@ ReservationService::ReservationService(platform::CouchbaseClient& client, const 
       holds_(client_, kHoldsCollection),
       pnrs_(client_, kPnrsCollection),
       idempotency_(client_, kIdempotencyCollection),
-      flight_index_(client_, kFlightIndexCollection) {
-  if (!caches_) {
-    caches_ = std::make_shared<cache::ClientCaches>();
-  }
-}
+      flight_index_(client_, kFlightIndexCollection) {}
 
 Result<domain::Flight> ReservationService::FlightFromId(const std::string& flight_id) {
-  auto cached = caches_->schedule->GetFlight(client_, flight_id);
-  if (!cached) {
-    return Result<domain::Flight>::Failure(cached.error());
+  if (caches_) {
+    auto cached = caches_->schedule->GetFlight(client_, flight_id);
+    if (!cached) {
+      return Result<domain::Flight>::Failure(cached.error());
+    }
+    return Result<domain::Flight>::Success(*cached.value());
   }
-  return Result<domain::Flight>::Success(*cached.value());
+  auto loaded = flights_.Get(FlightKey(flight_id));
+  if (!loaded) {
+    return Result<domain::Flight>::Failure(loaded.error());
+  }
+  if (!loaded.value().has_value()) {
+    return Result<domain::Flight>::Failure(
+        Error::Make(ErrorCode::FlightNotFound, "Flight not found — run load to materialize catalog"));
+  }
+  return Result<domain::Flight>::Success(std::move(loaded.value()->document));
 }
 
 Result<domain::Flight> ReservationService::ResolveFlight(
@@ -149,11 +156,20 @@ Result<std::vector<domain::BookableFlight>> ReservationService::ListBookableFlig
     if (!flight) {
       continue;
     }
-    auto inv = caches_->inventory->Get(client_, flight_id, catalog_meta_.resetEpoch);
-    if (!inv) {
-      continue;
+    domain::InventoryDocument inventory;
+    if (caches_) {
+      auto inv = caches_->inventory->Get(client_, flight_id, catalog_meta_.resetEpoch);
+      if (!inv) {
+        continue;
+      }
+      inventory = inv.value().document;
+    } else {
+      auto inv = LoadInventory(flight_id);
+      if (!inv) {
+        continue;
+      }
+      inventory = inv.value().document;
     }
-    const auto& inventory = inv.value().document;
     if (inventory.sold >= inventory.authorization) {
       continue;  // Full — omit from shopping options.
     }
@@ -204,13 +220,26 @@ Result<domain::FlightBookingResponse> ReservationService::BookFlight(
     }
     const auto flight = flight_loaded.value();
 
-    // Fence serializes writers for this flight; CAS remains the cross-process authority.
-    auto fence = caches_->inventory->Fence(request.flightId);
-    auto inv = caches_->inventory->GetForUpdate(client_, request.flightId, catalog_meta_.resetEpoch);
-    if (!inv) {
-      return Result<domain::FlightBookingResponse>::Failure(inv.error());
+    std::optional<cache::FlightWriteFence::Guard> fence;
+    domain::InventoryDocument inventory;
+    std::uint64_t cas = 0;
+    if (caches_) {
+      // Fence serializes writers for this flight; CAS remains the cross-process authority.
+      fence.emplace(caches_->inventory->Fence(request.flightId));
+      auto inv = caches_->inventory->GetForUpdate(client_, request.flightId, catalog_meta_.resetEpoch);
+      if (!inv) {
+        return Result<domain::FlightBookingResponse>::Failure(inv.error());
+      }
+      inventory = inv.value().document;
+      cas = inv.value().cas;
+    } else {
+      auto inv = LoadInventory(request.flightId);
+      if (!inv) {
+        return Result<domain::FlightBookingResponse>::Failure(inv.error());
+      }
+      inventory = inv.value().document;
+      cas = inv.value().cas;
     }
-    auto inventory = inv.value().document;
     const int qty = static_cast<int>(request.passengers.size());
     if (inventory.sold + qty > inventory.authorization) {
       return Result<domain::FlightBookingResponse>::Success(
@@ -239,15 +268,19 @@ Result<domain::FlightBookingResponse> ReservationService::BookFlight(
         }
       }
     }
-    auto replaced = inventory_.Replace(InventoryKey(request.flightId), inventory, inv.value().cas);
+    auto replaced = inventory_.Replace(InventoryKey(request.flightId), inventory, cas);
     if (!replaced) {
       if (replaced.error().code == ErrorCode::VersionConflict) {
-        caches_->inventory->Invalidate(request.flightId);
+        if (caches_) {
+          caches_->inventory->Invalidate(request.flightId);
+        }
         continue;
       }
       return Result<domain::FlightBookingResponse>::Failure(replaced.error());
     }
-    caches_->inventory->Put(request.flightId, inventory, replaced.value().cas, catalog_meta_.resetEpoch);
+    if (caches_) {
+      caches_->inventory->Put(request.flightId, inventory, replaced.value().cas, catalog_meta_.resetEpoch);
+    }
 
     const std::string locator = locators_.Next();
     const std::string confirmation = "CONF-" + locator;

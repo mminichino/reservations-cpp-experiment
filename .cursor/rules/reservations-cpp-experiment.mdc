@@ -48,9 +48,10 @@ Wire contract: `schema/airline-reservation.schema.json` (seat APIs **and** O&D `
 
 ## Client caches
 
-- `PriceSetCache` / `ScheduleCache`: cheap KV snapshot check; refill when `snapshotId` advances
-- `InventoryCache`: per-flight write fence + write-through; readers wait for fence; `BookFlight` = Fence → GetForUpdate → CAS → Put
-- One shared process-wide `cache::ClientCaches` for all exercise workers; stats show `cache` size + `avg_get`
+- Default `exercise` = pure KV; `-C` enables shared process-wide `cache::ClientCaches`
+- Price/schedule snapshot ids pinned from catalog meta (static for the experiment — no per-call snapshot Gets)
+- `InventoryCache`: per-flight fence + write-through; `BookFlight` = Fence → GetForUpdate → CAS → Put
+- Stats show `cache` size + `avg_get`
 
 ## Layout
 

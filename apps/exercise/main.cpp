@@ -239,10 +239,34 @@ void Worker(reservations::CouchbaseConfig config, reservations::schedule::Catalo
 }  // namespace
 
 int main(int argc, char** argv) {
-  const std::string env_path = (argc > 1) ? argv[1] : ".env";
+  std::string env_path = ".env";
   int threads = 4;
-  if (argc > 2) {
-    threads = std::max(1, std::atoi(argv[2]));
+  bool enable_cache = false;
+  bool saw_env = false;
+  bool saw_threads = false;
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "-C") {
+      enable_cache = true;
+      continue;
+    }
+    if (arg == "-h" || arg == "--help") {
+      std::cout << "Usage: exercise [env_file] [threads] [-C]\n"
+                << "  -C  enable process-wide client caches (default: pure KV / reflect-cpp)\n";
+      return 0;
+    }
+    if (!saw_env) {
+      env_path = arg;
+      saw_env = true;
+      continue;
+    }
+    if (!saw_threads) {
+      threads = std::max(1, std::atoi(arg.c_str()));
+      saw_threads = true;
+      continue;
+    }
+    std::cerr << "unexpected argument: " << arg << '\n';
+    return 1;
   }
 
   std::signal(SIGINT, OnSignal);
@@ -278,7 +302,11 @@ int main(int argc, char** argv) {
   const std::uint64_t total_au =
       reservations::schedule::TotalFlights() * static_cast<std::uint64_t>(std::max(1, m.authorizationPerFlight));
   const auto markets = BuildShopMarkets();
-  auto caches = std::make_shared<reservations::cache::ClientCaches>();
+  std::shared_ptr<reservations::cache::ClientCaches> caches;
+  if (enable_cache) {
+    caches = std::make_shared<reservations::cache::ClientCaches>();
+    caches->PinSnapshotsFromCatalog(m);
+  }
 
   std::cout << "exercise: 99% ClassAvailability (O&D shop) / 1% BookFlight\n"
             << "  airlines=" << reservations::schedule::AirlineCount()
@@ -286,7 +314,8 @@ int main(int argc, char** argv) {
             << " flights=" << reservations::schedule::TotalFlights() << " markets=" << markets.size()
             << " reset_epoch=" << m.resetEpoch << " AU/flight=" << m.authorizationPerFlight
             << " total_AU=" << total_au << '\n'
-            << "  threads=" << threads << " shared process-wide cache"
+            << "  threads=" << threads
+            << (enable_cache ? " cache=on (shared, snapshot pinned)" : " cache=off (pure KV)")
             << " (stops when all AU sold or Ctrl+C)\n\n";
 
   std::atomic<std::uint64_t> tickets_sold{0};
@@ -324,7 +353,8 @@ int main(int argc, char** argv) {
     const auto kv = reservations::platform::KvGetStats::TakeAndReset();
     const auto sold = tickets_sold.load(std::memory_order_relaxed);
     const double pct = total_au == 0 ? 0.0 : (100.0 * static_cast<double>(sold) / static_cast<double>(total_au));
-    const std::string cache_sz = FormatBytes(static_cast<double>(caches->ApproxBytes()));
+    const std::string cache_sz =
+        FormatBytes(static_cast<double>(caches ? caches->ApproxBytes() : 0ULL));
     const std::string avg_get = FormatBytes(kv.AvgBytes());
     std::cout << std::fixed << std::setprecision(1) << std::setw(6) << tick << "  " << std::setw(10)
               << (static_cast<double>(shop.ok) / 5.0) << "  " << std::setw(8) << shop.p50 << "  "

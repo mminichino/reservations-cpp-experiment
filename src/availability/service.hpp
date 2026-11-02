@@ -13,8 +13,9 @@ namespace reservations::availability {
 
 class ClassAvailabilityService {
  public:
+  /// Pass nullptr caches for pure KV (reflect-cpp DocumentStore) path; non-null enables local caches.
   ClassAvailabilityService(platform::CouchbaseClient& client, const Clock& clock,
-                           std::shared_ptr<cache::ClientCaches> caches);
+                           std::shared_ptr<cache::ClientCaches> caches = nullptr);
 
   void SetCatalogMeta(schedule::CatalogMeta meta) { catalog_meta_ = std::move(meta); }
 
@@ -25,7 +26,7 @@ class ClassAvailabilityService {
   platform::CouchbaseClient& client_;
   const Clock& clock_;
   schedule::CatalogMeta catalog_meta_{};
-  std::shared_ptr<cache::ClientCaches> caches_;
+  std::shared_ptr<cache::ClientCaches> caches_;  // nullptr => no cache
 };
 
 }  // namespace reservations::availability
