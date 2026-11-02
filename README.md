@@ -246,7 +246,7 @@ Optional via `exercise -C` (default off = pure KV / reflect-cpp, no prerun). Whe
 | `ScheduleCache` | OD index + flight docs (warm + miss fill) |
 | `InventoryCache` | Per-flight fence + write-through; warm fills all flights |
 
-Stats columns `cache` / `avg_get` always print (`cache` is `0B` without `-C`).
+Stats columns `cache` / `avg_get` always print (`cache` is `0B` without `-C`). `avg_get` is mean found-document payload **per shop/book operation** (sum of Gets in that op), not per individual Get.
 
 ### Main APIs (`ReservationService`)
 

@@ -176,10 +176,12 @@ void Worker(reservations::CouchbaseConfig config, reservations::schedule::Catalo
           .departureDate = reservations::schedule::LocalDepartureDate(week, static_cast<int>(rng() % 7)),
       }};
 
+      reservations::platform::KvGetStats::BeginOperation();
       const auto start = std::chrono::steady_clock::now();
       auto result = shop.Check(req);
       const auto ms =
           std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      reservations::platform::KvGetStats::EndOperation();
       if (!result) {
         shop_stats.RecordError();
       } else {
@@ -218,10 +220,12 @@ void Worker(reservations::CouchbaseConfig config, reservations::schedule::Catalo
     }};
     req.contact = reservations::domain::ContactInfo{.email = "test@example.com", .phone = "+15550000001"};
 
+    reservations::platform::KvGetStats::BeginOperation();
     const auto start = std::chrono::steady_clock::now();
     auto result = seats.BookFlight(req);
     const auto ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    reservations::platform::KvGetStats::EndOperation();
     if (!result) {
       book_stats.RecordError();
     } else if (result.value().status == "confirmed") {
@@ -367,7 +371,7 @@ int main(int argc, char** argv) {
     const double pct = total_au == 0 ? 0.0 : (100.0 * static_cast<double>(sold) / static_cast<double>(total_au));
     const std::string cache_sz =
         FormatBytes(static_cast<double>(caches ? caches->ApproxBytes() : 0ULL));
-    const std::string avg_get = FormatBytes(kv.AvgBytes());
+    const std::string avg_get = FormatBytes(kv.AvgBytesPerOp());
     std::cout << std::fixed << std::setprecision(1) << std::setw(6) << tick << "  " << std::setw(10)
               << (static_cast<double>(shop.ok) / 5.0) << "  " << std::setw(8) << shop.p50 << "  "
               << std::setw(8) << shop.p95 << "  " << std::setw(8) << shop.p99 << "  " << std::setw(6)
