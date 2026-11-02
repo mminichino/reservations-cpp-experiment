@@ -38,7 +38,11 @@ struct CatalogMeta {
   double oversellPercent{domain::kDefaultOversellPercent};
   int physicalCapacityPerFlight{0};
   int authorizationPerFlight{0};
+  /// Mirrored on tiny KV docs `snapshot::prices` / `snapshot::schedule` for cheap cache checks.
   std::string priceSnapshotId;
+  std::string priceSnapshotDate;
+  std::string scheduleSnapshotId;
+  std::string scheduleSnapshotDate;
 };
 
 struct FlightRef {

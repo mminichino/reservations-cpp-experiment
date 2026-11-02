@@ -132,7 +132,9 @@ int main(int argc, char** argv) {
   const auto& m = meta.value();
   const std::uint64_t total_au = catalog * static_cast<std::uint64_t>(m.authorizationPerFlight);
 
-  std::cout << "  reset_epoch=" << m.resetEpoch << " snapshot=" << m.priceSnapshotId
+  std::cout << "  reset_epoch=" << m.resetEpoch
+            << " price_snapshot=" << m.priceSnapshotId
+            << " schedule_snapshot=" << m.scheduleSnapshotId
             << " physical_capacity/flight=" << m.physicalCapacityPerFlight
             << " AU/flight=" << m.authorizationPerFlight << " total_AU=" << total_au << '\n'
             << "Materializing markets/prices then flights (stats every 10s)...\n";

@@ -1,5 +1,8 @@
 #pragma once
 
+#include <memory>
+
+#include "cache/client_caches.hpp"
 #include "common/clock.hpp"
 #include "common/result.hpp"
 #include "domain/messages.hpp"
@@ -10,7 +13,8 @@ namespace reservations::availability {
 
 class ClassAvailabilityService {
  public:
-  ClassAvailabilityService(platform::CouchbaseClient& client, const Clock& clock);
+  ClassAvailabilityService(platform::CouchbaseClient& client, const Clock& clock,
+                           std::shared_ptr<cache::ClientCaches> caches);
 
   void SetCatalogMeta(schedule::CatalogMeta meta) { catalog_meta_ = std::move(meta); }
 
@@ -21,6 +25,7 @@ class ClassAvailabilityService {
   platform::CouchbaseClient& client_;
   const Clock& clock_;
   schedule::CatalogMeta catalog_meta_{};
+  std::shared_ptr<cache::ClientCaches> caches_;
 };
 
 }  // namespace reservations::availability
