@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdlib>
 #include <iomanip>
@@ -9,6 +10,7 @@
 #include <mutex>
 #include <random>
 #include <set>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -19,6 +21,7 @@
 #include "common/env.hpp"
 #include "common/uuid.hpp"
 #include "platform/couchbase_client.hpp"
+#include "platform/kv_stats.hpp"
 #include "schedule/catalog.hpp"
 #include "schedule/network.hpp"
 #include "seatmap/seed.hpp"
@@ -98,7 +101,29 @@ std::vector<MarketPair> BuildShopMarkets() {
   return out;
 }
 
+/// Formats byte counts as B / KiB / MiB / GiB with one decimal for scaled units.
+std::string FormatBytes(double bytes) {
+  if (!std::isfinite(bytes) || bytes < 0.0) {
+    return "0B";
+  }
+  static constexpr const char* kUnits[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+  double value = bytes;
+  int unit = 0;
+  while (value >= 1024.0 && unit < 4) {
+    value /= 1024.0;
+    ++unit;
+  }
+  std::ostringstream oss;
+  if (unit == 0) {
+    oss << static_cast<std::uint64_t>(value + 0.5) << kUnits[unit];
+  } else {
+    oss << std::fixed << std::setprecision(1) << value << kUnits[unit];
+  }
+  return oss.str();
+}
+
 void Worker(reservations::CouchbaseConfig config, reservations::schedule::CatalogMeta meta,
+            std::shared_ptr<reservations::cache::ClientCaches> caches,
             std::atomic<std::uint64_t>& tickets_sold, std::uint64_t total_au, LatencyStats& shop_stats,
             LatencyStats& book_stats, const std::vector<MarketPair>& markets) {
   reservations::platform::CouchbaseClient client(config);
@@ -112,7 +137,6 @@ void Worker(reservations::CouchbaseConfig config, reservations::schedule::Catalo
   }
 
   reservations::SystemClock clock;
-  auto caches = std::make_shared<reservations::cache::ClientCaches>();
   reservations::availability::ClassAvailabilityService shop(client, clock, caches);
   shop.SetCatalogMeta(meta);
   reservations::seatmap::ReservationService seats(client, clock, caches);
@@ -254,6 +278,7 @@ int main(int argc, char** argv) {
   const std::uint64_t total_au =
       reservations::schedule::TotalFlights() * static_cast<std::uint64_t>(std::max(1, m.authorizationPerFlight));
   const auto markets = BuildShopMarkets();
+  auto caches = std::make_shared<reservations::cache::ClientCaches>();
 
   std::cout << "exercise: 99% ClassAvailability (O&D shop) / 1% BookFlight\n"
             << "  airlines=" << reservations::schedule::AirlineCount()
@@ -261,26 +286,33 @@ int main(int argc, char** argv) {
             << " flights=" << reservations::schedule::TotalFlights() << " markets=" << markets.size()
             << " reset_epoch=" << m.resetEpoch << " AU/flight=" << m.authorizationPerFlight
             << " total_AU=" << total_au << '\n'
-            << "  threads=" << threads << " (stops when all AU sold or Ctrl+C)\n\n";
+            << "  threads=" << threads << " shared process-wide cache"
+            << " (stops when all AU sold or Ctrl+C)\n\n";
 
   std::atomic<std::uint64_t> tickets_sold{0};
   LatencyStats shop_stats;
   LatencyStats book_stats;
   std::vector<std::thread> workers;
   for (int i = 0; i < threads; ++i) {
-    workers.emplace_back(Worker, config.value(), m, std::ref(tickets_sold), total_au, std::ref(shop_stats),
-                         std::ref(book_stats), std::cref(markets));
+    workers.emplace_back(Worker, config.value(), m, caches, std::ref(tickets_sold), total_au,
+                         std::ref(shop_stats), std::ref(book_stats), std::cref(markets));
   }
 
-  std::cout << std::right << std::setw(6) << "#"
-            << "  " << std::setw(10) << "shop/s" << "  " << std::setw(8) << "p50ms" << "  " << std::setw(8)
-            << "p95ms" << "  " << std::setw(8) << "p99ms" << "  " << std::setw(6) << "err" << "  "
-            << std::setw(7) << "empty"
-            << "  |  " << std::setw(10) << "book/s" << "  " << std::setw(8) << "p50ms" << "  " << std::setw(8)
-            << "p95ms" << "  " << std::setw(8) << "p99ms" << "  " << std::setw(6) << "err" << "  "
-            << std::setw(6) << "full" << "  " << std::setw(12) << "sold" << "  " << std::setw(6) << "%AU"
-            << '\n';
-  std::cout << std::string(118, '-') << '\n';
+  std::ostringstream header;
+  header << std::right << std::setw(6) << "#"
+         << "  " << std::setw(10) << "shop/s" << "  " << std::setw(8) << "p50ms" << "  " << std::setw(8)
+         << "p95ms" << "  " << std::setw(8) << "p99ms" << "  " << std::setw(6) << "err" << "  "
+         << std::setw(7) << "empty"
+         << "  |  " << std::setw(10) << "book/s" << "  " << std::setw(8) << "p50ms" << "  " << std::setw(8)
+         << "p95ms" << "  " << std::setw(8) << "p99ms" << "  " << std::setw(6) << "err" << "  "
+         << std::setw(6) << "full" << "  " << std::setw(12) << "sold" << "  " << std::setw(6) << "%AU"
+         << "  |  " << std::setw(10) << "cache" << "  " << std::setw(10) << "avg_get";
+  const std::string header_line = header.str();
+  std::cout << header_line << '\n';
+  std::cout << std::string(header_line.size(), '-') << '\n';
+
+  // Drop bootstrap KV noise from the first interval average.
+  (void)reservations::platform::KvGetStats::TakeAndReset();
 
   int tick = 0;
   while (g_running.load(std::memory_order_relaxed) &&
@@ -289,8 +321,11 @@ int main(int argc, char** argv) {
     ++tick;
     const auto shop = shop_stats.TakeAndReset();
     const auto book = book_stats.TakeAndReset();
+    const auto kv = reservations::platform::KvGetStats::TakeAndReset();
     const auto sold = tickets_sold.load(std::memory_order_relaxed);
     const double pct = total_au == 0 ? 0.0 : (100.0 * static_cast<double>(sold) / static_cast<double>(total_au));
+    const std::string cache_sz = FormatBytes(static_cast<double>(caches->ApproxBytes()));
+    const std::string avg_get = FormatBytes(kv.AvgBytes());
     std::cout << std::fixed << std::setprecision(1) << std::setw(6) << tick << "  " << std::setw(10)
               << (static_cast<double>(shop.ok) / 5.0) << "  " << std::setw(8) << shop.p50 << "  "
               << std::setw(8) << shop.p95 << "  " << std::setw(8) << shop.p99 << "  " << std::setw(6)
@@ -298,7 +333,8 @@ int main(int argc, char** argv) {
               << (static_cast<double>(book.ok) / 5.0) << "  " << std::setw(8) << book.p50 << "  "
               << std::setw(8) << book.p95 << "  " << std::setw(8) << book.p99 << "  " << std::setw(6)
               << book.errors << "  " << std::setw(6) << book.soft << "  " << std::setw(12) << sold << "  "
-              << std::setw(6) << pct << '\n';
+              << std::setw(6) << pct << "  |  " << std::setw(10) << cache_sz << "  " << std::setw(10)
+              << avg_get << '\n';
   }
 
   g_running.store(false, std::memory_order_relaxed);

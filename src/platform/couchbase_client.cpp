@@ -6,6 +6,8 @@
 #include <thread>
 #include <utility>
 
+#include "platform/kv_stats.hpp"
+
 #include <couchbase/cluster.hxx>
 #include <couchbase/codec/codec_flags.hxx>
 #include <couchbase/codec/encoded_value.hxx>
@@ -406,6 +408,7 @@ Result<KvResult> CouchbaseClient::Get(std::string_view collection, std::string_v
         Error::Make(ErrorCode::InternalError, fmt::format("get decode: {}", ex.what())));
   }
   out.cas = result.cas().value();
+  KvGetStats::RecordFound(out.value.size());
   return Result<KvResult>::Success(std::move(out));
 }
 

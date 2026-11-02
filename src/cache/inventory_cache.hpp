@@ -22,6 +22,7 @@ class InventoryCache {
     domain::InventoryDocument document;
     std::uint64_t cas{0};
     std::uint64_t resetEpoch{0};
+    std::uint64_t bytes{0};
   };
 
   [[nodiscard]] FlightWriteFence::Guard Fence(std::string flight_id) {
@@ -44,12 +45,15 @@ class InventoryCache {
 
   [[nodiscard]] FlightWriteFence& fence() noexcept { return fence_; }
 
+  [[nodiscard]] std::uint64_t ApproxBytes() const;
+
  private:
   [[nodiscard]] Result<Entry> LoadFromKv(platform::CouchbaseClient& client, std::string_view flight_id,
                                          std::uint64_t reset_epoch);
 
   FlightWriteFence fence_;
-  std::mutex mu_;
+  mutable std::mutex mu_;
+  std::uint64_t approx_bytes_{0};
   std::unordered_map<std::string, Entry> entries_;
 };
 

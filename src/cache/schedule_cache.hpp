@@ -28,13 +28,23 @@ class ScheduleCache {
 
   [[nodiscard]] platform::DataSnapshotDocument CurrentSnapshot() const;
 
+  [[nodiscard]] std::uint64_t ApproxBytes() const;
+
  private:
   [[nodiscard]] Result<platform::DataSnapshotDocument> FetchSnapshot(platform::CouchbaseClient& client);
 
+  template <typename T>
+  struct Entry {
+    std::string snapshot_id;
+    std::shared_ptr<const T> value;
+    std::uint64_t bytes{0};
+  };
+
   mutable std::mutex mu_;
   platform::DataSnapshotDocument snapshot_{};
-  std::unordered_map<std::string, std::pair<std::string, std::shared_ptr<const std::vector<std::string>>>> od_;
-  std::unordered_map<std::string, std::pair<std::string, std::shared_ptr<const domain::Flight>>> flights_;
+  std::uint64_t approx_bytes_{0};
+  std::unordered_map<std::string, Entry<std::vector<std::string>>> od_;
+  std::unordered_map<std::string, Entry<domain::Flight>> flights_;
 };
 
 }  // namespace reservations::cache

@@ -3,6 +3,8 @@
 #include <chrono>
 #include <utility>
 
+#include <rfl/json.hpp>
+
 #include "platform/document_store.hpp"
 #include "seatmap/service.hpp"
 
@@ -20,9 +22,17 @@ Result<InventoryCache::Entry> InventoryCache::LoadFromKv(platform::CouchbaseClie
     return Result<Entry>::Failure(
         Error::Make(ErrorCode::NotFound, "Inventory missing for " + std::string(flight_id)));
   }
-  return Result<Entry>::Success(Entry{.document = std::move(loaded.value()->document),
-                                      .cas = loaded.value()->cas,
-                                      .resetEpoch = loaded.value()->document.resetEpoch});
+  Entry entry{.document = std::move(loaded.value()->document),
+              .cas = loaded.value()->cas,
+              .resetEpoch = loaded.value()->document.resetEpoch,
+              .bytes = 0};
+  entry.bytes = rfl::json::write(entry.document).size() + std::string(flight_id).size();
+  return Result<Entry>::Success(std::move(entry));
+}
+
+std::uint64_t InventoryCache::ApproxBytes() const {
+  std::lock_guard lock(mu_);
+  return approx_bytes_;
 }
 
 Result<InventoryCache::Entry> InventoryCache::Get(platform::CouchbaseClient& client,
@@ -44,7 +54,13 @@ Result<InventoryCache::Entry> InventoryCache::Get(platform::CouchbaseClient& cli
   }
   {
     std::lock_guard lock(mu_);
-    entries_[std::string(flight_id)] = loaded.value();
+    const std::string key(flight_id);
+    auto existing = entries_.find(key);
+    if (existing != entries_.end()) {
+      approx_bytes_ -= existing->second.bytes;
+    }
+    approx_bytes_ += loaded.value().bytes;
+    entries_[key] = loaded.value();
   }
   return loaded;
 }
@@ -52,28 +68,48 @@ Result<InventoryCache::Entry> InventoryCache::Get(platform::CouchbaseClient& cli
 Result<InventoryCache::Entry> InventoryCache::GetForUpdate(platform::CouchbaseClient& client,
                                                            std::string_view flight_id,
                                                            std::uint64_t reset_epoch) {
-  // Caller must already hold the fence. Always refresh from KV for a fresh CAS.
   auto loaded = LoadFromKv(client, flight_id, reset_epoch);
   if (!loaded) {
     return loaded;
   }
   {
     std::lock_guard lock(mu_);
-    entries_[std::string(flight_id)] = loaded.value();
+    const std::string key(flight_id);
+    auto existing = entries_.find(key);
+    if (existing != entries_.end()) {
+      approx_bytes_ -= existing->second.bytes;
+    }
+    approx_bytes_ += loaded.value().bytes;
+    entries_[key] = loaded.value();
   }
   return loaded;
 }
 
 void InventoryCache::Put(std::string_view flight_id, domain::InventoryDocument document, std::uint64_t cas,
                          std::uint64_t reset_epoch) {
+  Entry entry{.document = std::move(document),
+              .cas = cas,
+              .resetEpoch = reset_epoch,
+              .bytes = 0};
+  entry.bytes = rfl::json::write(entry.document).size() + std::string(flight_id).size();
   std::lock_guard lock(mu_);
-  entries_[std::string(flight_id)] =
-      Entry{.document = std::move(document), .cas = cas, .resetEpoch = reset_epoch};
+  const std::string key(flight_id);
+  auto existing = entries_.find(key);
+  if (existing != entries_.end()) {
+    approx_bytes_ -= existing->second.bytes;
+  }
+  approx_bytes_ += entry.bytes;
+  entries_[key] = std::move(entry);
 }
 
 void InventoryCache::Invalidate(std::string_view flight_id) {
   std::lock_guard lock(mu_);
-  entries_.erase(std::string(flight_id));
+  auto it = entries_.find(std::string(flight_id));
+  if (it == entries_.end()) {
+    return;
+  }
+  approx_bytes_ -= it->second.bytes;
+  entries_.erase(it);
 }
 
 }  // namespace reservations::cache

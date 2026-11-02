@@ -2,15 +2,33 @@
 
 #include <utility>
 
+#include <rfl/json.hpp>
+
 #include "platform/document_store.hpp"
 #include "schedule/catalog.hpp"
 #include "seatmap/service.hpp"
 
 namespace reservations::cache {
+namespace {
+
+std::uint64_t OdPayloadBytes(const std::string& key, const std::vector<std::string>& ids) {
+  std::uint64_t n = key.size();
+  for (const auto& id : ids) {
+    n += id.size();
+  }
+  return n;
+}
+
+}  // namespace
 
 platform::DataSnapshotDocument ScheduleCache::CurrentSnapshot() const {
   std::lock_guard lock(mu_);
   return snapshot_;
+}
+
+std::uint64_t ScheduleCache::ApproxBytes() const {
+  std::lock_guard lock(mu_);
+  return approx_bytes_;
 }
 
 Result<platform::DataSnapshotDocument> ScheduleCache::FetchSnapshot(platform::CouchbaseClient& client) {
@@ -40,8 +58,8 @@ Result<std::shared_ptr<const std::vector<std::string>>> ScheduleCache::GetDirect
     std::lock_guard lock(mu_);
     snapshot_ = snap.value();
     auto it = od_.find(key);
-    if (it != od_.end() && it->second.first == snap_id && it->second.second) {
-      return Result<std::shared_ptr<const std::vector<std::string>>>::Success(it->second.second);
+    if (it != od_.end() && it->second.snapshot_id == snap_id && it->second.value) {
+      return Result<std::shared_ptr<const std::vector<std::string>>>::Success(it->second.value);
     }
   }
 
@@ -55,17 +73,24 @@ Result<std::shared_ptr<const std::vector<std::string>>> ScheduleCache::GetDirect
     ids = loaded.value()->document.flightIds;
   }
   auto ptr = std::make_shared<const std::vector<std::string>>(std::move(ids));
+  const std::uint64_t payload = OdPayloadBytes(key, *ptr);
   {
     std::lock_guard lock(mu_);
     snapshot_ = snap.value();
     for (auto it = od_.begin(); it != od_.end();) {
-      if (it->second.first != snap_id) {
+      if (it->second.snapshot_id != snap_id) {
+        approx_bytes_ -= it->second.bytes;
         it = od_.erase(it);
       } else {
         ++it;
       }
     }
-    od_[key] = {snap_id, ptr};
+    auto existing = od_.find(key);
+    if (existing != od_.end()) {
+      approx_bytes_ -= existing->second.bytes;
+    }
+    od_[key] = Entry<std::vector<std::string>>{.snapshot_id = snap_id, .value = ptr, .bytes = payload};
+    approx_bytes_ += payload;
   }
   return Result<std::shared_ptr<const std::vector<std::string>>>::Success(std::move(ptr));
 }
@@ -83,8 +108,8 @@ Result<std::shared_ptr<const domain::Flight>> ScheduleCache::GetFlight(platform:
     std::lock_guard lock(mu_);
     snapshot_ = snap.value();
     auto it = flights_.find(id);
-    if (it != flights_.end() && it->second.first == snap_id && it->second.second) {
-      return Result<std::shared_ptr<const domain::Flight>>::Success(it->second.second);
+    if (it != flights_.end() && it->second.snapshot_id == snap_id && it->second.value) {
+      return Result<std::shared_ptr<const domain::Flight>>::Success(it->second.value);
     }
   }
 
@@ -98,17 +123,24 @@ Result<std::shared_ptr<const domain::Flight>> ScheduleCache::GetFlight(platform:
         Error::Make(ErrorCode::FlightNotFound, "Flight not found"));
   }
   auto ptr = std::make_shared<const domain::Flight>(std::move(loaded.value()->document));
+  const std::uint64_t payload = rfl::json::write(*ptr).size() + id.size();
   {
     std::lock_guard lock(mu_);
     snapshot_ = snap.value();
     for (auto it = flights_.begin(); it != flights_.end();) {
-      if (it->second.first != snap_id) {
+      if (it->second.snapshot_id != snap_id) {
+        approx_bytes_ -= it->second.bytes;
         it = flights_.erase(it);
       } else {
         ++it;
       }
     }
-    flights_[id] = {snap_id, ptr};
+    auto existing = flights_.find(id);
+    if (existing != flights_.end()) {
+      approx_bytes_ -= existing->second.bytes;
+    }
+    flights_[id] = Entry<domain::Flight>{.snapshot_id = snap_id, .value = ptr, .bytes = payload};
+    approx_bytes_ += payload;
   }
   return Result<std::shared_ptr<const domain::Flight>>::Success(std::move(ptr));
 }

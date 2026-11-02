@@ -237,7 +237,7 @@ Flight identity is **deterministic** (UUID-shaped id from route/week/frequency i
 
 ### Client caches (`src/cache/`)
 
-Process-local (per exercise worker):
+One **process-wide** `ClientCaches` shared by all exercise workers (mutexes + inventory fence):
 
 | Cache | Currency | Behavior |
 |---|---|---|
@@ -245,7 +245,7 @@ Process-local (per exercise worker):
 | `ScheduleCache` | `Get snapshot::schedule` | OD index + flight docs keyed by schedule snapshotId |
 | `InventoryCache` | per-flight fence + `resetEpoch` | Readers wait for fence (~100ms then KV); hit if fresh else fill; `BookFlight` fences, KV Get+CAS, write-through `Put` |
 
-Shopping may be briefly stale across workers until the next fill. Booking remains CAS-authoritative under the local fence.
+`exercise` stats add `cache` (approx resident size) and `avg_get` (mean found-document payload over the interval). Booking remains CAS-authoritative under the shared fence.
 
 ### Main APIs (`ReservationService`)
 

@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <utility>
 
+#include <rfl/json.hpp>
+
 #include "platform/document_store.hpp"
 #include "schedule/catalog.hpp"
 
@@ -12,6 +14,11 @@ namespace reservations::cache {
 platform::DataSnapshotDocument PriceSetCache::CurrentSnapshot() const {
   std::lock_guard lock(mu_);
   return snapshot_;
+}
+
+std::uint64_t PriceSetCache::ApproxBytes() const {
+  std::lock_guard lock(mu_);
+  return approx_bytes_;
 }
 
 Result<platform::DataSnapshotDocument> PriceSetCache::FetchSnapshot(platform::CouchbaseClient& client) {
@@ -72,8 +79,8 @@ Result<std::shared_ptr<const std::vector<domain::PriceRecord>>> PriceSetCache::G
     std::lock_guard lock(mu_);
     snapshot_ = snap.value();
     auto it = by_market_.find(market);
-    if (it != by_market_.end() && it->second.first == snap_id && it->second.second) {
-      return Result<std::shared_ptr<const std::vector<domain::PriceRecord>>>::Success(it->second.second);
+    if (it != by_market_.end() && it->second.snapshot_id == snap_id && it->second.records) {
+      return Result<std::shared_ptr<const std::vector<domain::PriceRecord>>>::Success(it->second.records);
     }
   }
 
@@ -82,18 +89,24 @@ Result<std::shared_ptr<const std::vector<domain::PriceRecord>>> PriceSetCache::G
     return Result<std::shared_ptr<const std::vector<domain::PriceRecord>>>::Failure(loaded.error());
   }
   auto ptr = std::make_shared<const std::vector<domain::PriceRecord>>(std::move(loaded.value()));
+  const std::uint64_t payload = rfl::json::write(*ptr).size() + market.size();
   {
     std::lock_guard lock(mu_);
     snapshot_ = snap.value();
-    // Drop entries for other snapshots when the global price snapshot advances.
     for (auto it = by_market_.begin(); it != by_market_.end();) {
-      if (it->second.first != snap_id) {
+      if (it->second.snapshot_id != snap_id) {
+        approx_bytes_ -= it->second.bytes;
         it = by_market_.erase(it);
       } else {
         ++it;
       }
     }
-    by_market_[market] = {snap_id, ptr};
+    auto existing = by_market_.find(market);
+    if (existing != by_market_.end()) {
+      approx_bytes_ -= existing->second.bytes;
+    }
+    by_market_[market] = MarketEntry{.snapshot_id = snap_id, .records = ptr, .bytes = payload};
+    approx_bytes_ += payload;
   }
   return Result<std::shared_ptr<const std::vector<domain::PriceRecord>>>::Success(std::move(ptr));
 }
