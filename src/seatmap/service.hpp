@@ -1,10 +1,12 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <variant>
 #include <vector>
 
+#include "cache/client_caches.hpp"
 #include "common/clock.hpp"
 #include "common/result.hpp"
 #include "common/uuid.hpp"
@@ -48,7 +50,8 @@ inline std::vector<std::string> AllCollections() {
 /// Thread-safety: externally synchronized through CouchbaseClient.
 class ReservationService {
  public:
-  ReservationService(platform::CouchbaseClient& client, const Clock& clock);
+  ReservationService(platform::CouchbaseClient& client, const Clock& clock,
+                     std::shared_ptr<cache::ClientCaches> caches);
 
   void SetCatalogMeta(schedule::CatalogMeta meta) { catalog_meta_ = std::move(meta); }
   [[nodiscard]] const schedule::CatalogMeta& catalog_meta() const { return catalog_meta_; }
@@ -81,6 +84,7 @@ class ReservationService {
   platform::CouchbaseClient& client_;
   const Clock& clock_;
   schedule::CatalogMeta catalog_meta_{};
+  std::shared_ptr<cache::ClientCaches> caches_;
   UuidGenerator uuid_;
   RecordLocatorGenerator locators_;
 

@@ -11,8 +11,11 @@
 
 #include <cstdio>
 
+#include "common/clock.hpp"
+#include "common/time_format.hpp"
 #include "domain/pricing.hpp"
 #include "platform/document_store.hpp"
+#include "platform/snapshot.hpp"
 #include "pricing/engine.hpp"
 #include "schedule/network.hpp"
 #include "seatmap/service.hpp"
@@ -315,13 +318,34 @@ Result<schedule::CatalogMeta> ResetCatalog(platform::CouchbaseClient& client) {
   meta.physicalCapacityPerFlight = TemplatePhysicalCapacity();
   meta.authorizationPerFlight =
       domain::AuthorizationFor(meta.physicalCapacityPerFlight, meta.oversellPercent);
-  meta.priceSnapshotId = "snap-" + std::to_string(meta.resetEpoch);
+  SystemClock clock;
+  const std::string snap_date = FormatRfc3339(clock.Now());
+  meta.priceSnapshotId = "price-snap-" + std::to_string(meta.resetEpoch);
+  meta.priceSnapshotDate = snap_date;
+  meta.scheduleSnapshotId = "sched-snap-" + std::to_string(meta.resetEpoch);
+  meta.scheduleSnapshotDate = snap_date;
 
   auto upserted = meta_store.Upsert(schedule::kCatalogMetaKey, meta);
   if (!upserted) {
     return Result<schedule::CatalogMeta>::Failure(upserted.error());
   }
   return Result<schedule::CatalogMeta>::Success(meta);
+}
+
+Result<void> PublishSnapshots(platform::CouchbaseClient& client, const schedule::CatalogMeta& meta) {
+  platform::DocumentStore<platform::DataSnapshotDocument> store(client, schedule::kMetaCollection);
+  auto prices = store.Upsert(platform::kPriceSnapshotKey,
+                             platform::MakePriceSnapshot(meta.priceSnapshotId, meta.priceSnapshotDate));
+  if (!prices) {
+    return Result<void>::Failure(prices.error());
+  }
+  auto schedule = store.Upsert(
+      platform::kScheduleSnapshotKey,
+      platform::MakeScheduleSnapshot(meta.scheduleSnapshotId, meta.scheduleSnapshotDate));
+  if (!schedule) {
+    return Result<void>::Failure(schedule.error());
+  }
+  return Result<void>::Success();
 }
 
 Result<void> SeedCatalog(const CouchbaseConfig& config, const schedule::CatalogMeta& meta,
@@ -420,6 +444,22 @@ Result<void> SeedCatalog(const CouchbaseConfig& config, const schedule::CatalogM
   if (err > 0) {
     return Result<void>::Failure(Error::Make(
         ErrorCode::InternalError, "Seed finished with " + std::to_string(err) + " flight failures"));
+  }
+
+  // Publish tiny snapshot docs only after materialization so caches do not pin empty OD/price pages.
+  {
+    platform::CouchbaseClient client(config);
+    if (auto connected = client.Connect(); !connected) {
+      return Result<void>::Failure(connected.error());
+    }
+    if (auto opened = client.OpenBucket(); !opened) {
+      return Result<void>::Failure(opened.error());
+    }
+    if (auto published = PublishSnapshots(client, meta); !published) {
+      return published;
+    }
+    std::cout << "Published snapshot::prices=" << meta.priceSnapshotId
+              << " snapshot::schedule=" << meta.scheduleSnapshotId << '\n';
   }
   return Result<void>::Success();
 }

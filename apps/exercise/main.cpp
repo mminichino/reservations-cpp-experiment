@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <set>
@@ -13,6 +14,7 @@
 #include <vector>
 
 #include "availability/service.hpp"
+#include "cache/client_caches.hpp"
 #include "common/clock.hpp"
 #include "common/env.hpp"
 #include "common/uuid.hpp"
@@ -110,9 +112,10 @@ void Worker(reservations::CouchbaseConfig config, reservations::schedule::Catalo
   }
 
   reservations::SystemClock clock;
-  reservations::availability::ClassAvailabilityService shop(client, clock);
+  auto caches = std::make_shared<reservations::cache::ClientCaches>();
+  reservations::availability::ClassAvailabilityService shop(client, clock, caches);
   shop.SetCatalogMeta(meta);
-  reservations::seatmap::ReservationService seats(client, clock);
+  reservations::seatmap::ReservationService seats(client, clock, caches);
   seats.SetCatalogMeta(meta);
   reservations::UuidGenerator uuids;
   std::mt19937_64 rng{std::random_device{}()};

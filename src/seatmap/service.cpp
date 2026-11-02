@@ -63,27 +63,29 @@ domain::FlightBookingResponse FailedBooking(const std::string& request_id, const
 
 }  // namespace
 
-ReservationService::ReservationService(platform::CouchbaseClient& client, const Clock& clock)
+ReservationService::ReservationService(platform::CouchbaseClient& client, const Clock& clock,
+                                       std::shared_ptr<cache::ClientCaches> caches)
     : client_(client),
       clock_(clock),
+      caches_(std::move(caches)),
       flights_(client_, kFlightsCollection),
       seatmaps_(client_, kSeatmapsCollection),
       inventory_(client_, kInventoryCollection),
       holds_(client_, kHoldsCollection),
       pnrs_(client_, kPnrsCollection),
       idempotency_(client_, kIdempotencyCollection),
-      flight_index_(client_, kFlightIndexCollection) {}
+      flight_index_(client_, kFlightIndexCollection) {
+  if (!caches_) {
+    caches_ = std::make_shared<cache::ClientCaches>();
+  }
+}
 
 Result<domain::Flight> ReservationService::FlightFromId(const std::string& flight_id) {
-  auto loaded = flights_.Get(FlightKey(flight_id));
-  if (!loaded) {
-    return Result<domain::Flight>::Failure(loaded.error());
+  auto cached = caches_->schedule->GetFlight(client_, flight_id);
+  if (!cached) {
+    return Result<domain::Flight>::Failure(cached.error());
   }
-  if (!loaded.value().has_value()) {
-    return Result<domain::Flight>::Failure(
-        Error::Make(ErrorCode::FlightNotFound, "Flight not found — run load to materialize catalog"));
-  }
-  return Result<domain::Flight>::Success(std::move(loaded.value()->document));
+  return Result<domain::Flight>::Success(*cached.value());
 }
 
 Result<domain::Flight> ReservationService::ResolveFlight(
@@ -147,7 +149,7 @@ Result<std::vector<domain::BookableFlight>> ReservationService::ListBookableFlig
     if (!flight) {
       continue;
     }
-    auto inv = LoadInventory(flight_id);
+    auto inv = caches_->inventory->Get(client_, flight_id, catalog_meta_.resetEpoch);
     if (!inv) {
       continue;
     }
@@ -202,7 +204,9 @@ Result<domain::FlightBookingResponse> ReservationService::BookFlight(
     }
     const auto flight = flight_loaded.value();
 
-    auto inv = LoadInventory(request.flightId);
+    // Fence serializes writers for this flight; CAS remains the cross-process authority.
+    auto fence = caches_->inventory->Fence(request.flightId);
+    auto inv = caches_->inventory->GetForUpdate(client_, request.flightId, catalog_meta_.resetEpoch);
     if (!inv) {
       return Result<domain::FlightBookingResponse>::Failure(inv.error());
     }
@@ -238,10 +242,12 @@ Result<domain::FlightBookingResponse> ReservationService::BookFlight(
     auto replaced = inventory_.Replace(InventoryKey(request.flightId), inventory, inv.value().cas);
     if (!replaced) {
       if (replaced.error().code == ErrorCode::VersionConflict) {
+        caches_->inventory->Invalidate(request.flightId);
         continue;
       }
       return Result<domain::FlightBookingResponse>::Failure(replaced.error());
     }
+    caches_->inventory->Put(request.flightId, inventory, replaced.value().cas, catalog_meta_.resetEpoch);
 
     const std::string locator = locators_.Next();
     const std::string confirmation = "CONF-" + locator;

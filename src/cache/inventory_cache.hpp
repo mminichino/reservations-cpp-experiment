@@ -1,0 +1,56 @@
+#pragma once
+
+#include <cstdint>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+
+#include "cache/flight_write_fence.hpp"
+#include "common/result.hpp"
+#include "domain/types.hpp"
+#include "platform/couchbase_client.hpp"
+
+namespace reservations::cache {
+
+/// Fenced, write-through inventory cache. Book paths take a fence Guard for the flight;
+/// readers wait for the fence, then use cache or fill from KV.
+class InventoryCache {
+ public:
+  struct Entry {
+    domain::InventoryDocument document;
+    std::uint64_t cas{0};
+    std::uint64_t resetEpoch{0};
+  };
+
+  [[nodiscard]] FlightWriteFence::Guard Fence(std::string flight_id) {
+    return fence_.Acquire(std::move(flight_id));
+  }
+
+  /// Wait for fence, then return cached entry or load from KV and fill.
+  [[nodiscard]] Result<Entry> Get(platform::CouchbaseClient& client, std::string_view flight_id,
+                                  std::uint64_t reset_epoch);
+
+  /// Authoritative KV get (used under fence for BookFlight before CAS). Still waits for other writers.
+  [[nodiscard]] Result<Entry> GetForUpdate(platform::CouchbaseClient& client, std::string_view flight_id,
+                                           std::uint64_t reset_epoch);
+
+  /// Write-through after successful CAS Replace.
+  void Put(std::string_view flight_id, domain::InventoryDocument document, std::uint64_t cas,
+           std::uint64_t reset_epoch);
+
+  void Invalidate(std::string_view flight_id);
+
+  [[nodiscard]] FlightWriteFence& fence() noexcept { return fence_; }
+
+ private:
+  [[nodiscard]] Result<Entry> LoadFromKv(platform::CouchbaseClient& client, std::string_view flight_id,
+                                         std::uint64_t reset_epoch);
+
+  FlightWriteFence fence_;
+  std::mutex mu_;
+  std::unordered_map<std::string, Entry> entries_;
+};
+
+}  // namespace reservations::cache

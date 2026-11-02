@@ -1,16 +1,10 @@
 #include "availability/service.hpp"
 
 #include <algorithm>
-#include <cstdio>
 #include <set>
-#include <sstream>
-#include <unordered_map>
 
 #include "common/time_format.hpp"
-#include "common/uuid.hpp"
 #include "pricing/engine.hpp"
-#include "platform/document_store.hpp"
-#include "seatmap/service.hpp"
 
 namespace reservations::availability {
 namespace {
@@ -36,74 +30,6 @@ domain::CabinClass CabinForRbd(std::string_view rbd) {
     return domain::CabinClass::premium_economy;
   }
   return domain::CabinClass::economy;
-}
-
-std::vector<domain::PriceRecord> LoadAllMarketPrices(platform::CouchbaseClient& client,
-                                                     std::string_view origin, std::string_view destination,
-                                                     std::string_view snapshot_id) {
-  platform::DocumentStore<domain::MarketMetaDocument> meta_store(client, schedule::kMarketsCollection);
-  const std::string meta_key = "market_meta::" + schedule::MarketKey(origin, destination);
-  auto meta = meta_store.Get(meta_key);
-  std::vector<domain::PriceRecord> all;
-  if (!meta || !meta.value().has_value()) {
-    return all;
-  }
-  const int pages = std::max(1, meta.value()->document.pageCount);
-  platform::DocumentStore<domain::MarketPricePageDocument> page_store(client, schedule::kPricesCollection);
-  for (int p = 1; p <= pages; ++p) {
-    char key[128];
-    std::snprintf(key, sizeof(key), "prices::%s::%s::p%04d", std::string(origin).c_str(),
-                  std::string(destination).c_str(), p);
-    auto page = page_store.Get(key);
-    if (!page || !page.value().has_value()) {
-      continue;
-    }
-    if (!snapshot_id.empty() && page.value()->document.snapshotId != snapshot_id &&
-        page.value()->document.snapshotId != meta.value()->document.snapshotId) {
-      continue;
-    }
-    auto& recs = page.value()->document.records;
-    all.insert(all.end(), std::make_move_iterator(recs.begin()), std::make_move_iterator(recs.end()));
-  }
-  return all;
-}
-
-Result<domain::InventoryDocument> LoadInventory(platform::CouchbaseClient& client,
-                                                const std::string& flight_id,
-                                                std::uint64_t epoch) {
-  platform::DocumentStore<domain::InventoryDocument> store(client, seatmap::kInventoryCollection);
-  auto loaded = store.Get(seatmap::InventoryKey(flight_id));
-  if (!loaded) {
-    return Result<domain::InventoryDocument>::Failure(loaded.error());
-  }
-  if (!loaded.value().has_value() || loaded.value()->document.resetEpoch < epoch) {
-    return Result<domain::InventoryDocument>::Failure(
-        Error::Make(ErrorCode::NotFound, "Inventory missing for " + flight_id));
-  }
-  return Result<domain::InventoryDocument>::Success(std::move(loaded.value()->document));
-}
-
-Result<domain::Flight> LoadFlight(platform::CouchbaseClient& client, const std::string& flight_id) {
-  platform::DocumentStore<domain::Flight> store(client, seatmap::kFlightsCollection);
-  auto loaded = store.Get(seatmap::FlightKey(flight_id));
-  if (!loaded) {
-    return Result<domain::Flight>::Failure(loaded.error());
-  }
-  if (!loaded.value().has_value()) {
-    return Result<domain::Flight>::Failure(Error::Make(ErrorCode::FlightNotFound, "Flight not found"));
-  }
-  return Result<domain::Flight>::Success(std::move(loaded.value()->document));
-}
-
-std::vector<std::string> DirectFlights(platform::CouchbaseClient& client, std::string_view origin,
-                                       std::string_view destination, std::string_view date,
-                                       std::uint64_t epoch) {
-  platform::DocumentStore<domain::OdFlightIndexDocument> store(client, schedule::kOdIndexCollection);
-  auto loaded = store.Get(schedule::OdDateIndexKey(origin, destination, date));
-  if (!loaded || !loaded.value().has_value() || loaded.value()->document.resetEpoch < epoch) {
-    return {};
-  }
-  return loaded.value()->document.flightIds;
 }
 
 domain::ClassAvailability EvaluateClass(const domain::InventoryDocument& inv,
@@ -153,7 +79,6 @@ domain::ClassAvailability EvaluateClass(const domain::InventoryDocument& inv,
     return out;
   }
 
-  // Bid-price check against cabin.
   if (!inv.legs.empty()) {
     for (const auto& cabin : inv.legs.front().cabins) {
       if (cabin.cabin == out.cabin && cabin.bidPrice.has_value()) {
@@ -186,8 +111,13 @@ domain::ClassAvailability EvaluateClass(const domain::InventoryDocument& inv,
 
 }  // namespace
 
-ClassAvailabilityService::ClassAvailabilityService(platform::CouchbaseClient& client, const Clock& clock)
-    : client_(client), clock_(clock) {}
+ClassAvailabilityService::ClassAvailabilityService(platform::CouchbaseClient& client, const Clock& clock,
+                                                   std::shared_ptr<cache::ClientCaches> caches)
+    : client_(client), clock_(clock), caches_(std::move(caches)) {
+  if (!caches_) {
+    caches_ = std::make_shared<cache::ClientCaches>();
+  }
+}
 
 Result<domain::ClassAvailabilityResponse> ClassAvailabilityService::Check(
     const domain::ClassAvailabilityRequest& request) {
@@ -232,14 +162,23 @@ Result<domain::ClassAvailabilityResponse> ClassAvailabilityService::Check(
     slice_out.departureDate = slice.departureDate;
 
     domain::Market market{.origin = slice.origin, .destination = slice.destination};
-    const std::string snap = catalog_meta_.priceSnapshotId.empty() ? "snap-1" : catalog_meta_.priceSnapshotId;
-    auto prices = LoadAllMarketPrices(client_, slice.origin, slice.destination, snap);
+
+    auto prices_ptr = caches_->prices->GetMarketPrices(client_, slice.origin, slice.destination);
+    if (!prices_ptr) {
+      return Result<domain::ClassAvailabilityResponse>::Failure(prices_ptr.error());
+    }
+    const auto& prices = *prices_ptr.value();
+    const std::string snap = caches_->prices->CurrentSnapshot().snapshotId;
     if (snapshot_markets.insert(schedule::MarketKey(slice.origin, slice.destination)).second) {
-      response.priceSnapshots.push_back(domain::PriceSnapshotRef{.market = market, .snapshotId = snap});
+      response.priceSnapshots.push_back(
+          domain::PriceSnapshotRef{.market = market, .snapshotId = snap.empty() ? "unknown" : snap});
     }
 
-    auto directs = DirectFlights(client_, slice.origin, slice.destination, slice.departureDate,
-                                 catalog_meta_.resetEpoch);
+    auto directs = caches_->schedule->GetDirectFlights(client_, slice.origin, slice.destination,
+                                                       slice.departureDate, catalog_meta_.resetEpoch);
+    if (!directs) {
+      return Result<domain::ClassAvailabilityResponse>::Failure(directs.error());
+    }
 
     int journey_count = 0;
     auto add_journey = [&](std::vector<std::string> flight_ids, const std::vector<domain::Market>& markets) {
@@ -254,44 +193,49 @@ Result<domain::ClassAvailabilityResponse> ClassAvailabilityService::Check(
 
       bool ok = true;
       for (std::size_t seg_i = 0; seg_i < flight_ids.size(); ++seg_i) {
-        auto flight = LoadFlight(client_, flight_ids[seg_i]);
+        auto flight = caches_->schedule->GetFlight(client_, flight_ids[seg_i]);
         if (!flight) {
           ok = false;
           break;
         }
         domain::JourneySegment seg;
         seg.segmentIndex = static_cast<int>(seg_i);
-        seg.flight = std::move(flight.value());
+        seg.flight = *flight.value();
         seg.boardPoint = seg.flight.origin;
         seg.offPoint = seg.flight.destination;
 
-        auto inv = LoadInventory(client_, flight_ids[seg_i], catalog_meta_.resetEpoch);
+        auto inv = caches_->inventory->Get(client_, flight_ids[seg_i], catalog_meta_.resetEpoch);
         if (!inv) {
           ok = false;
           break;
         }
 
-        // Prices for this segment's market (local O&D of the flight).
         domain::Market seg_market{.origin = seg.boardPoint, .destination = seg.offPoint};
-        auto seg_prices = (seg_market.origin == market.origin && seg_market.destination == market.destination)
-                              ? prices
-                              : LoadAllMarketPrices(client_, seg_market.origin, seg_market.destination, snap);
+        std::shared_ptr<const std::vector<domain::PriceRecord>> seg_prices_ptr = prices_ptr.value();
+        if (!(seg_market.origin == market.origin && seg_market.destination == market.destination)) {
+          auto loaded =
+              caches_->prices->GetMarketPrices(client_, seg_market.origin, seg_market.destination);
+          if (!loaded) {
+            ok = false;
+            break;
+          }
+          seg_prices_ptr = loaded.value();
+        }
 
         std::vector<domain::ClassAvailability> class_avails;
         for (const char* rbd : kRbds) {
           class_avails.push_back(
-              EvaluateClass(inv.value(), seg_prices, ctx, seg_market, rbd, explain, seat_cap));
+              EvaluateClass(inv.value().document, *seg_prices_ptr, ctx, seg_market, rbd, explain, seat_cap));
         }
         if (detail == "segment" || detail == "leg") {
           seg.classes = class_avails;
         }
         if (detail == "leg") {
-          seg.legs = inv.value().legs;
+          seg.legs = inv.value().document.legs;
         }
         if (seg_i == 0) {
-          journey.classes = class_avails;  // end-to-end starts as first segment; connections tighten below
+          journey.classes = class_avails;
         } else {
-          // Nest: open only if open on every segment; seats = min.
           for (auto& jc : journey.classes) {
             auto it = std::find_if(class_avails.begin(), class_avails.end(),
                                    [&](const domain::ClassAvailability& c) {
@@ -314,28 +258,27 @@ Result<domain::ClassAvailabilityResponse> ClassAvailabilityService::Check(
       ++journey_count;
     };
 
-    // Directs.
-    for (const auto& fid : directs) {
+    for (const auto& fid : *directs.value()) {
       add_journey({fid}, {market});
     }
 
-    // One-stop via hubs (same calendar day index).
     if (max_conn >= 1) {
       for (const auto hub : schedule::kConnectionHubs) {
         if (hub == slice.origin || hub == slice.destination) {
           continue;
         }
-        auto leg1 = DirectFlights(client_, slice.origin, hub, slice.departureDate, catalog_meta_.resetEpoch);
-        auto leg2 = DirectFlights(client_, hub, slice.destination, slice.departureDate, catalog_meta_.resetEpoch);
-        if (leg1.empty() || leg2.empty()) {
+        auto leg1 = caches_->schedule->GetDirectFlights(client_, slice.origin, hub, slice.departureDate,
+                                                        catalog_meta_.resetEpoch);
+        auto leg2 = caches_->schedule->GetDirectFlights(client_, hub, slice.destination, slice.departureDate,
+                                                        catalog_meta_.resetEpoch);
+        if (!leg1 || !leg2 || leg1.value()->empty() || leg2.value()->empty()) {
           continue;
         }
-        // Pair first few options to bound fan-out.
-        const std::size_t n1 = std::min<std::size_t>(leg1.size(), 2);
-        const std::size_t n2 = std::min<std::size_t>(leg2.size(), 2);
+        const std::size_t n1 = std::min<std::size_t>(leg1.value()->size(), 2);
+        const std::size_t n2 = std::min<std::size_t>(leg2.value()->size(), 2);
         for (std::size_t i = 0; i < n1; ++i) {
           for (std::size_t j = 0; j < n2; ++j) {
-            add_journey({leg1[i], leg2[j]},
+            add_journey({(*leg1.value())[i], (*leg2.value())[j]},
                         {domain::Market{.origin = slice.origin, .destination = std::string(hub)},
                          domain::Market{.origin = std::string(hub), .destination = slice.destination},
                          market});

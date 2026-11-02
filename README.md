@@ -231,17 +231,29 @@ Wire contract: `schema/airline-reservation.schema.json` (seat map APIs **and** O
 
 Flight identity is **deterministic** (UUID-shaped id from route/week/frequency index). Origins, destinations, and connection hubs are real airports served by these airlines; schedules/prices beyond that are synthetic.
 
-### Reset epoch
+### Reset epoch + snapshots
 
-`load` bumps `catalog_meta.resetEpoch` (and price snapshot id), reseeds market prices, then rematerializes per-flight docs empty/open. `exercise` requires current-epoch docs—missing/stale → error (re-run `load`). Use `-d` to drop and recreate the bucket.
+`load` bumps `catalog_meta.resetEpoch`, assigns `priceSnapshotId` / `scheduleSnapshotId` (+ dates), reseeds market prices, rematerializes per-flight docs, then publishes tiny KV docs `snapshot::prices` and `snapshot::schedule` in `meta`. A future dedicated price/schedule load can advance those docs without a full catalog rebuild. `exercise` requires current-epoch inventory and published snapshots—missing/stale → error (re-run `load`). Use `-d` to drop and recreate the bucket.
+
+### Client caches (`src/cache/`)
+
+Process-local (per exercise worker):
+
+| Cache | Currency | Behavior |
+|---|---|---|
+| `PriceSetCache` | `Get snapshot::prices` | Serve market price set if snapshotId matches; else refill from paged `prices` |
+| `ScheduleCache` | `Get snapshot::schedule` | OD index + flight docs keyed by schedule snapshotId |
+| `InventoryCache` | per-flight fence + `resetEpoch` | Readers wait for fence (~100ms then KV); hit if fresh else fill; `BookFlight` fences, KV Get+CAS, write-through `Put` |
+
+Shopping may be briefly stale across workers until the next fill. Booking remains CAS-authoritative under the local fence.
 
 ### Main APIs (`ReservationService`)
 
 | Operation | Role |
 |---|---|
-| `ClassAvailabilityService::Check` | O&D class shopping: journeys, price match/precedence, open/close vs controls |
+| `ClassAvailabilityService::Check` | O&D class shopping via caches: journeys, price match/precedence, open/close vs controls |
 | `CheckAvailability` | Seat-map view for one flight; empty seats OK when nothing selectable |
-| `BookFlight` | Sell booking class (default Y) up to limit; PNR without seat assignment |
+| `BookFlight` | Fenced sell of booking class (default Y) up to AU; PNR without seat assignment |
 | `HoldSeats` / `PurchaseSeats` | Physical seat hold / assignment (ancillary path) |
 
 Overselling bookings past physical seats is intentional (AU). Seat selection then simply shows an empty map rather than failing the ticket.
@@ -253,7 +265,7 @@ Scope: `airline`
 
 | Collection | Contents |
 |---|---|
-| `meta` | Catalog meta / reset epoch / price snapshot id |
+| `meta` | Catalog meta / reset epoch; tiny `snapshot::prices` + `snapshot::schedule` |
 | `markets` / `prices` | Market meta + paged conditional `PriceRecord`s |
 | `od_index` | Direct flight ids by origin/destination/date |
 | `inventory` | Per-flight leg/class controls (+ legacy Y AU fields) |
@@ -266,11 +278,12 @@ Scope: `airline`
 ### Repository layout
 
 ```
-apps/load/          Epoch + market prices + parallel flight materialization
-apps/exercise/      99% ClassAvailability O&D / 1% BookFlight
+apps/load/          Epoch + market prices + parallel flight materialization + snapshots
+apps/exercise/      99% ClassAvailability O&D / 1% BookFlight (per-worker caches)
 src/common/         Result/error model, env, clock, ids
 src/domain/         Reflected document + message + pricing types
-src/platform/       Couchbase C++ SDK client, DocumentStore<T>
+src/platform/       Couchbase C++ SDK client, DocumentStore<T>, snapshot helpers
+src/cache/          Price / schedule / inventory client caches + flight write fence
 src/schedule/       OneWorld/Star network, catalog indexing
 src/pricing/        Conditional price match + precedence
 src/availability/   ClassAvailability engine

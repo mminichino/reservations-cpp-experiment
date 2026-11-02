@@ -42,19 +42,25 @@ Wire contract: `schema/airline-reservation.schema.json` (seat APIs **and** O&D `
 
 ## Load / materialization
 
-- `load`: topology; bump epoch; seed market prices; parallel upsert inventory (leg/class), seatmap, flight, indexes, `od_index`
+- `load`: topology; bump epoch + price/schedule snapshot ids; seed market prices; parallel upsert inventory (leg/class), seatmap, flight, indexes, `od_index`; publish tiny `snapshot::prices` / `snapshot::schedule` after seed
 - Flags: `-j`, `-d` (drop bucket), `--subset` / `--start`
 - Stats every 10s + summary; **no lazy create** in exercise paths
+
+## Client caches
+
+- `PriceSetCache` / `ScheduleCache`: cheap KV snapshot check; refill when `snapshotId` advances
+- `InventoryCache`: per-flight write fence + write-through; readers wait for fence; `BookFlight` = Fence → GetForUpdate → CAS → Put
+- Process-local per exercise worker (`cache::ClientCaches`)
 
 ## Layout
 
 ```
 apps/load, apps/exercise
-src/common, domain, platform, schedule, pricing, availability, seatmap
+src/common, domain, platform, cache, schedule, pricing, availability, seatmap
 schema/airline-reservation.schema.json
 ```
 
-Collections: `meta`, `markets`, `prices`, `od_index`, `inventory`, `seatmaps`, `flights`, `flight_index`, `pnrs`, `holds`, `idempotency`.
+Collections: `meta` (incl. snapshot docs), `markets`, `prices`, `od_index`, `inventory`, `seatmaps`, `flights`, `flight_index`, `pnrs`, `holds`, `idempotency`.
 
 ## Synthetic data
 
