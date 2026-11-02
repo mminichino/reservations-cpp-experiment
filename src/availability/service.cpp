@@ -204,7 +204,7 @@ Result<domain::ClassAvailabilityResponse> ClassAvailabilityService::Check(
   const bool explain = request.explain.value_or(false);
   const int max_conn = request.filters.has_value() ? request.filters->maxConnections.value_or(1) : 1;
   const int max_journeys =
-      request.filters.has_value() ? request.filters->maxJourneysPerSlice.value_or(50) : 50;
+      request.filters.has_value() ? request.filters->maxJourneysPerSlice.value_or(20) : 20;
   const std::string detail = request.detailLevel.value_or("segment");
   const std::string booking_date = BookingDateFromRequest(request, clock_);
   const bool use_cache = caches_ != nullptr;
