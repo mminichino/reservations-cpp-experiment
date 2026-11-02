@@ -156,11 +156,11 @@ Binaries:
 ./build/exercise .env [threads] [-C]
 ```
 
-Default threads: `4`. Default is **pure KV** (no local cache). Pass `-C` to enable the shared process-wide client caches (price/schedule snapshot ids pinned for the run).
+Default threads: `4`. Default is **pure KV** (no local cache, no warm). Pass `-C` to enable shared process-wide caches: snapshot ids are pinned, then a **full warm prerun** loads all price markets (incl. hub legs), OD×date indexes, flights, and inventory before timed measurement starts.
 
 ```bash
 ./build/exercise .env 32       # KV baseline
-./build/exercise .env 32 -C    # with caches
+./build/exercise .env 32 -C    # warm + caches, then measure
 ```
 
 Workload mix:
@@ -238,13 +238,13 @@ Flight identity is **deterministic** (UUID-shaped id from route/week/frequency i
 
 ### Client caches (`src/cache/`)
 
-Optional via `exercise -C` (default off = pure KV / reflect-cpp). When enabled, one **process-wide** `ClientCaches` is shared by all workers. Price/schedule snapshot ids are **pinned** from `catalog_meta` at start (experiment treats that data as static — no per-call snapshot Gets).
+Optional via `exercise -C` (default off = pure KV / reflect-cpp, no prerun). When enabled: pin price/schedule snapshot ids from `catalog_meta`, run `cache::WarmAll` (full catalog into process memory), then start workers and measure.
 
 | Cache | Behavior |
 |---|---|
-| `PriceSetCache` | Cache full market price sets; fill from paged `prices` on miss |
-| `ScheduleCache` | Cache OD index + flight docs on miss |
-| `InventoryCache` | Per-flight fence + write-through; readers wait for fence; `BookFlight` = Fence → GetForUpdate → CAS → Put |
+| `PriceSetCache` | Full market price sets (warm + miss fill) |
+| `ScheduleCache` | OD index + flight docs (warm + miss fill) |
+| `InventoryCache` | Per-flight fence + write-through; warm fills all flights |
 
 Stats columns `cache` / `avg_get` always print (`cache` is `0B` without `-C`).
 

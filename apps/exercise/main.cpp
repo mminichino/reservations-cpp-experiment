@@ -17,6 +17,7 @@
 
 #include "availability/service.hpp"
 #include "cache/client_caches.hpp"
+#include "cache/warm.hpp"
 #include "common/clock.hpp"
 #include "common/env.hpp"
 #include "common/uuid.hpp"
@@ -252,7 +253,8 @@ int main(int argc, char** argv) {
     }
     if (arg == "-h" || arg == "--help") {
       std::cout << "Usage: exercise [env_file] [threads] [-C]\n"
-                << "  -C  enable process-wide client caches (default: pure KV / reflect-cpp)\n";
+                << "  -C  enable process-wide client caches + full warm prerun\n"
+                << "      (default: pure KV / reflect-cpp, no warm)\n";
       return 0;
     }
     if (!saw_env) {
@@ -315,8 +317,18 @@ int main(int argc, char** argv) {
             << " reset_epoch=" << m.resetEpoch << " AU/flight=" << m.authorizationPerFlight
             << " total_AU=" << total_au << '\n'
             << "  threads=" << threads
-            << (enable_cache ? " cache=on (shared, snapshot pinned)" : " cache=off (pure KV)")
+            << (enable_cache ? " cache=on (shared, snapshot pinned, full warm prerun)"
+                             : " cache=off (pure KV, no warm)")
             << " (stops when all AU sold or Ctrl+C)\n\n";
+
+  if (enable_cache) {
+    auto warmed = reservations::cache::WarmAll(config.value(), *caches, m, threads);
+    if (!warmed) {
+      std::cerr << "cache warm error: " << warmed.error().message << '\n';
+      return 1;
+    }
+    std::cout << '\n';
+  }
 
   std::atomic<std::uint64_t> tickets_sold{0};
   LatencyStats shop_stats;

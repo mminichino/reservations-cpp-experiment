@@ -64,6 +64,7 @@ add_library(reservations_core
   src/cache/price_set_cache.cpp
   src/cache/schedule_cache.cpp
   src/cache/inventory_cache.cpp
+  src/cache/warm.cpp
 )
 add_library(reservations::core ALIAS reservations_core)
 
