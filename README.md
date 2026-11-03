@@ -244,7 +244,12 @@ Optional via `exercise -C` (default off = pure KV / reflect-cpp, no prerun). Whe
 |---|---|
 | `PriceSetCache` | Full market price sets (warm + miss fill) |
 | `ScheduleCache` | OD index + flight docs (warm + miss fill) |
-| `InventoryCache` | Per-flight fence + write-through; warm fills all flights |
+| `InventoryCache` | Local + Couchbase fence; write-through; warm fills all flights |
+
+**Inventory coherence (book always, with or without `-C`):**
+- **Fence:** `BookFlight` Upserts `fence::inv::<flightId>` (TTL 5s), Removes on release. Shop waits (~100ms); if a fence was seen, full inventory KV refill.
+- **Generation sidecar:** after successful inventory CAS, Upsert `inv_gen::<flightId>` `{cas}`. Cached shop Gets the sidecar; cache hit only if `cas` matches the local entry—otherwise full inventory refill. Keeps cross-process freshness after the fence is gone without pulling ~1.5 KiB inventory on every hit.
+- Local `FlightWriteFence` for in-process writers; inventory CAS remains write authority.
 
 Stats columns `cache` / `avg_get` always print (`cache` is `0B` without `-C`). `avg_get` is mean found-document payload **per shop/book operation** (sum of Gets in that op), not per individual Get.
 
@@ -284,7 +289,7 @@ apps/exercise/      99% ClassAvailability O&D / 1% BookFlight (`-C` optional sha
 src/common/         Result/error model, env, clock, ids
 src/domain/         Reflected document + message + pricing types
 src/platform/       Couchbase C++ SDK client, DocumentStore<T>, snapshot helpers
-src/cache/          Price / schedule / inventory client caches + flight write fence
+src/cache/          Price / schedule / inventory caches + local/KV inventory fences
 src/schedule/       OneWorld/Star network, catalog indexing
 src/pricing/        Conditional price match + precedence
 src/availability/   ClassAvailability engine

@@ -6,6 +6,8 @@
 #include <optional>
 #include <sstream>
 
+#include "cache/distributed_inventory_fence.hpp"
+#include "cache/inventory_generation.hpp"
 #include "common/time_format.hpp"
 #include "seatmap/synthetic.hpp"
 
@@ -131,6 +133,8 @@ Result<platform::DocumentStore<domain::SeatMapDocument>::Loaded> ReservationServ
 
 Result<platform::DocumentStore<domain::InventoryDocument>::Loaded> ReservationService::LoadInventory(
     const std::string& flight_id) {
+  (void)cache::DistributedInventoryFence::WaitUntilClear(client_, flight_id,
+                                                         std::chrono::milliseconds{100});
   auto loaded = inventory_.Get(InventoryKey(flight_id));
   if (!loaded) {
     return Result<platform::DocumentStore<domain::InventoryDocument>::Loaded>::Failure(loaded.error());
@@ -220,12 +224,19 @@ Result<domain::FlightBookingResponse> ReservationService::BookFlight(
     }
     const auto flight = flight_loaded.value();
 
-    std::optional<cache::FlightWriteFence::Guard> fence;
+    // Local fence (optional) + KV fence (always): cross-process shop waits on fence::inv::<id>.
+    std::optional<cache::FlightWriteFence::Guard> local_fence;
+    if (caches_) {
+      local_fence.emplace(caches_->inventory->Fence(request.flightId));
+    }
+    auto kv_fence = cache::DistributedInventoryFence::Acquire(client_, request.flightId);
+    if (!kv_fence) {
+      return Result<domain::FlightBookingResponse>::Failure(kv_fence.error());
+    }
+
     domain::InventoryDocument inventory;
     std::uint64_t cas = 0;
     if (caches_) {
-      // Fence serializes writers for this flight; CAS remains the cross-process authority.
-      fence.emplace(caches_->inventory->Fence(request.flightId));
       auto inv = caches_->inventory->GetForUpdate(client_, request.flightId, catalog_meta_.resetEpoch);
       if (!inv) {
         return Result<domain::FlightBookingResponse>::Failure(inv.error());
@@ -233,12 +244,21 @@ Result<domain::FlightBookingResponse> ReservationService::BookFlight(
       inventory = inv.value().document;
       cas = inv.value().cas;
     } else {
-      auto inv = LoadInventory(request.flightId);
-      if (!inv) {
-        return Result<domain::FlightBookingResponse>::Failure(inv.error());
+      // Skip LoadInventory's read-side wait — we already hold the KV fence.
+      auto loaded = inventory_.Get(InventoryKey(request.flightId));
+      if (!loaded) {
+        return Result<domain::FlightBookingResponse>::Failure(loaded.error());
       }
-      inventory = inv.value().document;
-      cas = inv.value().cas;
+      if (!loaded.value().has_value()) {
+        return Result<domain::FlightBookingResponse>::Failure(
+            Error::Make(ErrorCode::NotFound, "Inventory missing — run load to materialize catalog"));
+      }
+      if (loaded.value()->document.resetEpoch < catalog_meta_.resetEpoch) {
+        return Result<domain::FlightBookingResponse>::Failure(Error::Make(
+            ErrorCode::NotFound, "Inventory stale vs catalog epoch — re-run load to rematerialize"));
+      }
+      inventory = loaded.value()->document;
+      cas = loaded.value()->cas;
     }
     const int qty = static_cast<int>(request.passengers.size());
     if (inventory.sold + qty > inventory.authorization) {
@@ -274,13 +294,16 @@ Result<domain::FlightBookingResponse> ReservationService::BookFlight(
         if (caches_) {
           caches_->inventory->Invalidate(request.flightId);
         }
-        continue;
+        continue;  // kv_fence Guard releases; next attempt re-acquires
       }
       return Result<domain::FlightBookingResponse>::Failure(replaced.error());
     }
     if (caches_) {
       caches_->inventory->Put(request.flightId, inventory, replaced.value().cas, catalog_meta_.resetEpoch);
     }
+    // Sidecar so peer shop caches detect this CAS without loading the full inventory doc.
+    (void)cache::PublishInventoryGeneration(client_, request.flightId, replaced.value().cas);
+    // kv_fence / local_fence release as they leave scope after successful mutate.
 
     const std::string locator = locators_.Next();
     const std::string confirmation = "CONF-" + locator;

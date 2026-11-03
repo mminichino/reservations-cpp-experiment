@@ -14,8 +14,9 @@
 
 namespace reservations::cache {
 
-/// Fenced, write-through inventory cache. Book paths take a fence Guard for the flight;
-/// readers wait for the fence, then use cache or fill from KV.
+/// Write-through inventory cache. Local FlightWriteFence + Couchbase fence::inv::<id>.
+/// Shop waits on fences; serves cache only if no remote fence was seen and inv_gen::<id>
+/// CAS matches the cached entry; otherwise full inventory KV refill.
 class InventoryCache {
  public:
   struct Entry {

@@ -5,6 +5,8 @@
 
 #include <rfl/json.hpp>
 
+#include "cache/distributed_inventory_fence.hpp"
+#include "cache/inventory_generation.hpp"
 #include "platform/document_store.hpp"
 #include "seatmap/service.hpp"
 
@@ -27,6 +29,7 @@ Result<InventoryCache::Entry> InventoryCache::LoadFromKv(platform::CouchbaseClie
               .resetEpoch = loaded.value()->document.resetEpoch,
               .bytes = 0};
   entry.bytes = rfl::json::write(entry.document).size() + std::string(flight_id).size();
+  (void)PublishInventoryGeneration(client, flight_id, entry.cas);
   return Result<Entry>::Success(std::move(entry));
 }
 
@@ -38,13 +41,30 @@ std::uint64_t InventoryCache::ApproxBytes() const {
 Result<InventoryCache::Entry> InventoryCache::Get(platform::CouchbaseClient& client,
                                                   std::string_view flight_id,
                                                   std::uint64_t reset_epoch) {
-  const bool fence_clear = fence_.WaitUntilClear(flight_id, std::chrono::milliseconds{100});
+  const bool local_clear = fence_.WaitUntilClear(flight_id, std::chrono::milliseconds{100});
+  const auto remote = DistributedInventoryFence::WaitUntilClear(client, flight_id,
+                                                                std::chrono::milliseconds{100});
 
-  if (fence_clear) {
-    std::lock_guard lock(mu_);
-    auto it = entries_.find(std::string(flight_id));
-    if (it != entries_.end() && it->second.resetEpoch >= reset_epoch) {
-      return Result<Entry>::Success(it->second);
+  // Serve cache only when fences are clear, no remote fence was seen, and the generation
+  // sidecar still matches the cached inventory CAS (cross-process freshness).
+  const bool allow_cache = local_clear && remote.clear && !remote.saw_fence;
+  if (allow_cache) {
+    Entry cached;
+    bool have_cached = false;
+    {
+      std::lock_guard lock(mu_);
+      auto it = entries_.find(std::string(flight_id));
+      if (it != entries_.end() && it->second.resetEpoch >= reset_epoch) {
+        cached = it->second;
+        have_cached = true;
+      }
+    }
+    if (have_cached) {
+      auto gen = FetchInventoryGeneration(client, flight_id);
+      if (gen && gen.value().has_value() && *gen.value() == cached.cas) {
+        return Result<Entry>::Success(std::move(cached));
+      }
+      // Missing sidecar or CAS mismatch → fall through to full inventory load.
     }
   }
 

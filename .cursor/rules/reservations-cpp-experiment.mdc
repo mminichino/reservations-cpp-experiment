@@ -51,7 +51,9 @@ Wire contract: `schema/airline-reservation.schema.json` (seat APIs **and** O&D `
 - Default `exercise` = pure KV (no warm); `-C` = shared `cache::ClientCaches` + full `WarmAll` prerun, then measure
 - Price/schedule snapshot ids pinned from catalog meta (static — no per-call snapshot Gets)
 - Warm loads all price markets (incl. hub legs), OD×date indexes, flights, inventory
-- `InventoryCache`: per-flight fence + write-through; `BookFlight` = Fence → GetForUpdate → CAS → Put
+- Inventory fence: KV `fence::inv::<flightId>` (TTL) on every `BookFlight`; readers wait; KV-refill if fence seen
+- Inventory generation sidecar `inv_gen::<flightId>` `{cas}` published after CAS; cached shop hit only if sidecar cas matches entry
+- Cached book: local fence → KV fence → GetForUpdate → CAS → Put → publish gen; CAS remains write authority
 - Stats show `cache` size + `avg_get`
 
 ## Layout
