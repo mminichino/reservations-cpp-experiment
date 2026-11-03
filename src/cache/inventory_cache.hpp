@@ -45,6 +45,9 @@ class InventoryCache {
 
   void Invalidate(std::string_view flight_id);
 
+  /// Stop GetMany workers so exercise can join promptly on Ctrl+C.
+  void ShutdownWorkers();
+
   [[nodiscard]] std::uint64_t ApproxBytes() const;
 
  private:

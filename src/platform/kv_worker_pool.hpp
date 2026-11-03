@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <functional>
@@ -16,6 +17,7 @@
 #include "common/env.hpp"
 #include "common/result.hpp"
 #include "platform/couchbase_client.hpp"
+#include "platform/shutdown.hpp"
 
 namespace reservations::platform {
 
@@ -43,11 +45,15 @@ class KvWorkerPool {
     for (int i = 0; i < workers_; ++i) {
       threads_.emplace_back([this] { WorkerLoop(); });
     }
-    // Wait until every worker has connected (or one failed).
     std::unique_lock ready_lock(ready_mu_);
-    ready_cv_.wait(ready_lock, [&] { return ready_count_ >= workers_ || start_error_.has_value(); });
+    ready_cv_.wait(ready_lock, [&] {
+      return ready_count_ >= workers_ || start_error_.has_value() || ShutdownRequested();
+    });
     if (start_error_.has_value()) {
       return Result<void>::Failure(*start_error_);
+    }
+    if (ShutdownRequested()) {
+      return Result<void>::Failure(Error::Make(ErrorCode::RateLimited, "shutdown during pool start"));
     }
     return Result<void>::Success();
   }
@@ -56,6 +62,9 @@ class KvWorkerPool {
   [[nodiscard]] Result<void> ParallelFor(std::size_t count, TaskFn fn) {
     if (count == 0) {
       return Result<void>::Success();
+    }
+    if (ShutdownRequested() || stopping_.load(std::memory_order_relaxed)) {
+      return Result<void>::Failure(Error::Make(ErrorCode::RateLimited, "shutdown"));
     }
     if (auto ready = EnsureStarted(); !ready) {
       return ready;
@@ -68,6 +77,9 @@ class KvWorkerPool {
 
     {
       std::lock_guard lock(mu_);
+      if (stopping_.load(std::memory_order_relaxed)) {
+        return Result<void>::Failure(Error::Make(ErrorCode::RateLimited, "pool stopping"));
+      }
       for (std::size_t i = 0; i < count; ++i) {
         queue_.push(WorkItem{.batch = batch, .index = i});
       }
@@ -75,11 +87,45 @@ class KvWorkerPool {
     cv_.notify_all();
 
     std::unique_lock done_lock(batch->done_mu);
-    batch->done_cv.wait(done_lock, [&] { return batch->remaining.load(std::memory_order_acquire) == 0; });
+    const auto shutdown_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds{3};
+    while (batch->remaining.load(std::memory_order_acquire) != 0) {
+      batch->done_cv.wait_for(done_lock, std::chrono::milliseconds{50});
+      if (batch->remaining.load(std::memory_order_acquire) == 0) {
+        break;
+      }
+      if (ShutdownRequested() || stopping_.load(std::memory_order_relaxed)) {
+        batch->failed.store(true, std::memory_order_relaxed);
+        {
+          std::lock_guard err_lock(batch->err_mu);
+          batch->first_error = Error::Make(ErrorCode::RateLimited, "interrupted");
+        }
+        cv_.notify_all();
+        if (std::chrono::steady_clock::now() >= shutdown_deadline) {
+          return Result<void>::Failure(batch->first_error);
+        }
+      }
+    }
     if (batch->failed.load(std::memory_order_relaxed)) {
       return Result<void>::Failure(batch->first_error);
     }
     return Result<void>::Success();
+  }
+
+  void Stop() {
+    {
+      std::lock_guard lock(mu_);
+      if (stopping_.exchange(true)) {
+        return;
+      }
+    }
+    cv_.notify_all();
+    for (auto& th : threads_) {
+      if (th.joinable()) {
+        th.join();
+      }
+    }
+    threads_.clear();
   }
 
   [[nodiscard]] int workers() const noexcept { return workers_; }
@@ -101,23 +147,6 @@ class KvWorkerPool {
     std::size_t index{0};
   };
 
-  void Stop() {
-    {
-      std::lock_guard lock(mu_);
-      if (stopping_) {
-        return;
-      }
-      stopping_ = true;
-    }
-    cv_.notify_all();
-    for (auto& th : threads_) {
-      if (th.joinable()) {
-        th.join();
-      }
-    }
-    threads_.clear();
-  }
-
   void WorkerLoop() {
     CouchbaseClient client(config_);
     if (auto connected = client.Connect(); !connected) {
@@ -138,16 +167,23 @@ class KvWorkerPool {
       WorkItem item;
       {
         std::unique_lock lock(mu_);
-        cv_.wait(lock, [&] { return stopping_ || !queue_.empty(); });
-        if (stopping_ && queue_.empty()) {
+        cv_.wait(lock, [&] {
+          return stopping_.load(std::memory_order_relaxed) || ShutdownRequested() || !queue_.empty();
+        });
+        if ((stopping_.load(std::memory_order_relaxed) || ShutdownRequested()) && queue_.empty()) {
           return;
+        }
+        if (queue_.empty()) {
+          continue;
         }
         item = std::move(queue_.front());
         queue_.pop();
       }
 
       auto& batch = *item.batch;
-      if (!batch.failed.load(std::memory_order_relaxed)) {
+      const bool skip = batch.failed.load(std::memory_order_relaxed) || ShutdownRequested() ||
+                        stopping_.load(std::memory_order_relaxed);
+      if (!skip) {
         auto result = batch.fn(client, item.index);
         if (!result) {
           if (!batch.failed.exchange(true)) {
@@ -180,7 +216,7 @@ class KvWorkerPool {
   std::queue<WorkItem> queue_;
   std::vector<std::thread> threads_;
   bool started_{false};
-  bool stopping_{false};
+  std::atomic<bool> stopping_{false};
 
   std::mutex ready_mu_;
   std::condition_variable ready_cv_;

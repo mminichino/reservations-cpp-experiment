@@ -23,6 +23,7 @@
 #include "common/uuid.hpp"
 #include "platform/couchbase_client.hpp"
 #include "platform/kv_stats.hpp"
+#include "platform/shutdown.hpp"
 #include "schedule/catalog.hpp"
 #include "schedule/network.hpp"
 #include "seatmap/seed.hpp"
@@ -33,7 +34,10 @@ namespace {
 
 std::atomic<bool> g_running{true};
 
-void OnSignal(int) { g_running.store(false, std::memory_order_relaxed); }
+void OnSignal(int) {
+  g_running.store(false, std::memory_order_relaxed);
+  reservations::platform::RequestShutdown();
+}
 
 struct LatencyStats {
   std::mutex mu;
@@ -351,7 +355,9 @@ int main(int argc, char** argv) {
          << "  |  " << std::setw(10) << "book/s" << "  " << std::setw(8) << "p50ms" << "  " << std::setw(8)
          << "p95ms" << "  " << std::setw(8) << "p99ms" << "  " << std::setw(6) << "err" << "  "
          << std::setw(6) << "full" << "  " << std::setw(12) << "sold" << "  " << std::setw(6) << "%AU"
-         << "  |  " << std::setw(10) << "cache" << "  " << std::setw(10) << "avg_get";
+         << "  |  " << std::setw(10) << "cache" << "  " << std::setw(10) << "avg_get" << "  "
+         << std::setw(10) << "max_get" << "  " << std::setw(10) << "avg_put" << "  " << std::setw(10)
+         << "max_put";
   const std::string header_line = header.str();
   std::cout << header_line << '\n';
   std::cout << std::string(header_line.size(), '-') << '\n';
@@ -362,7 +368,13 @@ int main(int argc, char** argv) {
   int tick = 0;
   while (g_running.load(std::memory_order_relaxed) &&
          tickets_sold.load(std::memory_order_relaxed) < total_au) {
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+    // Interruptible 5s sleep so Ctrl+C is noticed promptly.
+    for (int i = 0; i < 50 && g_running.load(std::memory_order_relaxed); ++i) {
+      std::this_thread::sleep_for(std::chrono::milliseconds{100});
+    }
+    if (!g_running.load(std::memory_order_relaxed)) {
+      break;
+    }
     ++tick;
     const auto shop = shop_stats.TakeAndReset();
     const auto book = book_stats.TakeAndReset();
@@ -371,7 +383,10 @@ int main(int argc, char** argv) {
     const double pct = total_au == 0 ? 0.0 : (100.0 * static_cast<double>(sold) / static_cast<double>(total_au));
     const std::string cache_sz =
         FormatBytes(static_cast<double>(caches ? caches->ApproxBytes() : 0ULL));
-    const std::string avg_get = FormatBytes(kv.AvgBytesPerOp());
+    const std::string avg_get = FormatBytes(kv.AvgGetBytesPerOp());
+    const std::string max_get = FormatBytes(static_cast<double>(kv.max_get));
+    const std::string avg_put = FormatBytes(kv.AvgPutBytesPerOp());
+    const std::string max_put = FormatBytes(static_cast<double>(kv.max_put));
     std::cout << std::fixed << std::setprecision(1) << std::setw(6) << tick << "  " << std::setw(10)
               << (static_cast<double>(shop.ok) / 5.0) << "  " << std::setw(8) << shop.p50 << "  "
               << std::setw(8) << shop.p95 << "  " << std::setw(8) << shop.p99 << "  " << std::setw(6)
@@ -380,10 +395,15 @@ int main(int argc, char** argv) {
               << std::setw(8) << book.p95 << "  " << std::setw(8) << book.p99 << "  " << std::setw(6)
               << book.errors << "  " << std::setw(6) << book.soft << "  " << std::setw(12) << sold << "  "
               << std::setw(6) << pct << "  |  " << std::setw(10) << cache_sz << "  " << std::setw(10)
-              << avg_get << '\n';
+              << avg_get << "  " << std::setw(10) << max_get << "  " << std::setw(10) << avg_put << "  "
+              << std::setw(10) << max_put << '\n';
   }
 
   g_running.store(false, std::memory_order_relaxed);
+  reservations::platform::RequestShutdown();
+  if (caches) {
+    caches->inventory->ShutdownWorkers();
+  }
   for (auto& w : workers) {
     w.join();
   }

@@ -147,4 +147,11 @@ void InventoryCache::Invalidate(std::string_view flight_id) {
   entries_.erase(it);
 }
 
+void InventoryCache::ShutdownWorkers() {
+  std::lock_guard lock(pool_mu_);
+  if (workers_) {
+    workers_->Stop();
+  }
+}
+
 }  // namespace reservations::cache

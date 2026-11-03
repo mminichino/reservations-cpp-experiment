@@ -12,6 +12,7 @@
 
 #include "common/result.hpp"
 #include "platform/couchbase_client.hpp"
+#include "platform/shutdown.hpp"
 
 namespace reservations::platform {
 
@@ -69,9 +70,11 @@ class DocumentStore {
       if (kv.error().code != ErrorCode::DocumentLocked) {
         return Result<std::pair<Loaded, KvLockGuard>>::Failure(kv.error());
       }
-      if (std::chrono::steady_clock::now() >= deadline) {
+      if (ShutdownRequested() || std::chrono::steady_clock::now() >= deadline) {
         return Result<std::pair<Loaded, KvLockGuard>>::Failure(
-            Error::Make(ErrorCode::RateLimited, "Timed out waiting for lock on " + std::string(key)));
+            Error::Make(ErrorCode::RateLimited, ShutdownRequested()
+                                                    ? "interrupted waiting for lock on " + std::string(key)
+                                                    : "Timed out waiting for lock on " + std::string(key)));
       }
       std::this_thread::sleep_for(kKvLockRetrySleep);
     }

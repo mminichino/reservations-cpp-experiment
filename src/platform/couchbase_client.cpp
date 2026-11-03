@@ -491,6 +491,7 @@ Result<MutationResult> CouchbaseClient::Upsert(std::string_view collection, std:
   if (err) {
     return Result<MutationResult>::Failure(FromSdkError(err, "upsert"));
   }
+  KvGetStats::RecordPut(value.size());
   return Result<MutationResult>::Success(MutationResult{.cas = result.cas().value()});
 }
 
@@ -511,6 +512,7 @@ Result<MutationResult> CouchbaseClient::Insert(std::string_view collection, std:
   if (err) {
     return Result<MutationResult>::Failure(FromSdkError(err, "insert"));
   }
+  KvGetStats::RecordPut(value.size());
   return Result<MutationResult>::Success(MutationResult{.cas = result.cas().value()});
 }
 
@@ -531,6 +533,7 @@ Result<MutationResult> CouchbaseClient::Replace(std::string_view collection, std
   if (err) {
     return Result<MutationResult>::Failure(FromSdkError(err, "replace"));
   }
+  KvGetStats::RecordPut(value.size());
   return Result<MutationResult>::Success(MutationResult{.cas = result.cas().value()});
 }
 
