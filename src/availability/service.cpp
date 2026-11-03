@@ -1,14 +1,12 @@
 #include "availability/service.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <memory>
 #include <mutex>
 #include <set>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -16,7 +14,7 @@
 #include "common/time_format.hpp"
 #include "domain/pricing.hpp"
 #include "platform/document_store.hpp"
-#include "platform/kv_client_pool.hpp"
+#include "platform/kv_worker_pool.hpp"
 #include "pricing/engine.hpp"
 #include "seatmap/service.hpp"
 
@@ -199,22 +197,22 @@ Result<domain::InventoryDocument> KvLoadInventory(platform::CouchbaseClient& cli
   return Result<domain::InventoryDocument>::Success(std::move(loaded.value()->document));
 }
 
-platform::KvClientPool& SharedPureKvPool(const CouchbaseConfig& config) {
+platform::KvWorkerPool& SharedPureKvWorkers(const CouchbaseConfig& config) {
   static std::mutex mu;
-  static std::unique_ptr<platform::KvClientPool> pool;
+  static std::unique_ptr<platform::KvWorkerPool> pool;
   static std::string conn;
   std::lock_guard lock(mu);
   if (!pool || conn != config.connection_string) {
-    pool = std::make_unique<platform::KvClientPool>(config, 64);
+    pool = std::make_unique<platform::KvWorkerPool>(config, 16);
     conn = config.connection_string;
   }
   return *pool;
 }
 
-/// Parallel pure-KV inventory loads; workers lease dedicated clients from a shared pool.
+/// Parallel pure-KV inventory loads on a persistent KvWorkerPool.
 Result<std::unordered_map<std::string, domain::InventoryDocument>> KvLoadInventoriesMany(
     const CouchbaseConfig& config, const std::vector<std::string>& flight_ids, std::uint64_t reset_epoch,
-    int parallelism = 16) {
+    int /*parallelism*/ = 16) {
   std::set<std::string> unique;
   for (const auto& id : flight_ids) {
     if (!id.empty()) {
@@ -227,54 +225,19 @@ Result<std::unordered_map<std::string, domain::InventoryDocument>> KvLoadInvento
     return Result<std::unordered_map<std::string, domain::InventoryDocument>>::Success(std::move(out));
   }
 
-  auto& kv_pool = SharedPureKvPool(config);
-  if (auto ready = kv_pool.EnsureReady(); !ready) {
-    return Result<std::unordered_map<std::string, domain::InventoryDocument>>::Failure(ready.error());
-  }
-
-  const int workers = std::max(1, std::min(parallelism, static_cast<int>(ids.size())));
-  std::atomic<std::size_t> next{0};
-  std::atomic<bool> failed{false};
-  std::mutex err_mu;
-  Error first_error = Error::Make(ErrorCode::InternalError, "inventory prefetch failed");
+  auto& workers = SharedPureKvWorkers(config);
   std::mutex out_mu;
-
-  std::vector<std::thread> threads;
-  threads.reserve(static_cast<std::size_t>(workers));
-  for (int t = 0; t < workers; ++t) {
-    threads.emplace_back([&] {
-      auto lease = kv_pool.Acquire();
-      if (!lease) {
-        if (!failed.exchange(true)) {
-          std::lock_guard lock(err_mu);
-          first_error = lease.error();
-        }
-        return;
-      }
-      platform::CouchbaseClient& client = *lease.value();
-      while (!failed.load(std::memory_order_relaxed)) {
-        const std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
-        if (i >= ids.size()) {
-          break;
-        }
-        auto loaded = KvLoadInventory(client, ids[i], reset_epoch);
-        if (!loaded) {
-          if (!failed.exchange(true)) {
-            std::lock_guard lock(err_mu);
-            first_error = loaded.error();
-          }
-          return;
-        }
-        std::lock_guard lock(out_mu);
-        out.emplace(ids[i], std::move(loaded.value()));
-      }
-    });
-  }
-  for (auto& th : threads) {
-    th.join();
-  }
-  if (failed.load(std::memory_order_relaxed)) {
-    return Result<std::unordered_map<std::string, domain::InventoryDocument>>::Failure(first_error);
+  auto ran = workers.ParallelFor(ids.size(), [&](platform::CouchbaseClient& client, std::size_t i) {
+    auto loaded = KvLoadInventory(client, ids[i], reset_epoch);
+    if (!loaded) {
+      return Result<void>::Failure(loaded.error());
+    }
+    std::lock_guard lock(out_mu);
+    out.emplace(ids[i], std::move(loaded.value()));
+    return Result<void>::Success();
+  });
+  if (!ran) {
+    return Result<std::unordered_map<std::string, domain::InventoryDocument>>::Failure(ran.error());
   }
   return Result<std::unordered_map<std::string, domain::InventoryDocument>>::Success(std::move(out));
 }
@@ -457,7 +420,7 @@ Result<domain::ClassAvailabilityResponse> ClassAvailabilityService::Check(
       }
       inv_by_flight.reserve(many.value().size());
       for (auto& [fid, entry] : many.value()) {
-        inv_by_flight.emplace(fid, std::move(entry.document));
+        inv_by_flight.emplace(fid, entry->document);
       }
     } else {
       auto many = KvLoadInventoriesMany(client_.config(), prefetch_ids, catalog_meta_.resetEpoch);

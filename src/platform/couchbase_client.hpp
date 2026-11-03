@@ -22,6 +22,12 @@ struct MutationResult {
   std::uint64_t cas{0};
 };
 
+/// Result of a subdoc existence probe that returns the document CAS without the body.
+struct LookupCasResult {
+  bool found{false};
+  std::uint64_t cas{0};
+};
+
 /// Thin Couchbase C++ SDK wrapper used by reflect-cpp document stores.
 /// Thread-safety: externally synchronized — one instance per thread, or protect with a mutex.
 class CouchbaseClient {
@@ -48,6 +54,10 @@ class CouchbaseClient {
   [[nodiscard]] Result<void> OpenBucket();
 
   [[nodiscard]] Result<KvResult> Get(std::string_view collection, std::string_view key);
+
+  /// Subdoc exists("type") — returns document CAS without loading the full body.
+  [[nodiscard]] Result<LookupCasResult> LookupCas(std::string_view collection, std::string_view key);
+
   [[nodiscard]] Result<MutationResult> Upsert(std::string_view collection, std::string_view key,
                                               std::string_view value,
                                               std::optional<std::uint32_t> expiry_seconds = std::nullopt);

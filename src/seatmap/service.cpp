@@ -7,7 +7,6 @@
 #include <sstream>
 
 #include "cache/distributed_inventory_fence.hpp"
-#include "cache/inventory_generation.hpp"
 #include "common/time_format.hpp"
 #include "seatmap/synthetic.hpp"
 
@@ -166,7 +165,7 @@ Result<std::vector<domain::BookableFlight>> ReservationService::ListBookableFlig
       if (!inv) {
         continue;
       }
-      inventory = inv.value().document;
+      inventory = inv.value()->document;
     } else {
       auto inv = LoadInventory(flight_id);
       if (!inv) {
@@ -241,8 +240,8 @@ Result<domain::FlightBookingResponse> ReservationService::BookFlight(
       if (!inv) {
         return Result<domain::FlightBookingResponse>::Failure(inv.error());
       }
-      inventory = inv.value().document;
-      cas = inv.value().cas;
+      inventory = inv.value()->document;
+      cas = inv.value()->cas;
     } else {
       // Skip LoadInventory's read-side wait — we already hold the KV fence.
       auto loaded = inventory_.Get(InventoryKey(request.flightId));
@@ -301,8 +300,7 @@ Result<domain::FlightBookingResponse> ReservationService::BookFlight(
     if (caches_) {
       caches_->inventory->Put(request.flightId, inventory, replaced.value().cas, catalog_meta_.resetEpoch);
     }
-    // Sidecar so peer shop caches detect this CAS without loading the full inventory doc.
-    (void)cache::PublishInventoryGeneration(client_, request.flightId, replaced.value().cas);
+    // Peer shops detect this revision via subdoc CAS on the inventory key (no sidecar).
     // kv_fence / local_fence release as they leave scope after successful mutate.
 
     const std::string locator = locators_.Next();

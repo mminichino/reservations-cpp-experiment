@@ -13,6 +13,7 @@
 #include <couchbase/codec/encoded_value.hxx>
 #include <couchbase/codec/raw_json_transcoder.hxx>
 #include <couchbase/codec/transcoder_traits.hxx>
+#include <couchbase/lookup_in_specs.hxx>
 #include <curl/curl.h>
 #include <fmt/format.h>
 #include <system_error>
@@ -410,6 +411,29 @@ Result<KvResult> CouchbaseClient::Get(std::string_view collection, std::string_v
   out.cas = result.cas().value();
   KvGetStats::RecordFound(out.value.size());
   return Result<KvResult>::Success(std::move(out));
+}
+
+Result<LookupCasResult> CouchbaseClient::LookupCas(std::string_view collection, std::string_view key) {
+  std::scoped_lock lock(impl_->mutex);
+  if (!impl_->cluster.has_value()) {
+    return Result<LookupCasResult>::Failure(
+        Error::Make(ErrorCode::ConnectionError, "cluster not connected"));
+  }
+  auto coll = CollectionFor(*impl_->cluster, config_, collection);
+  const couchbase::lookup_in_specs specs{couchbase::lookup_in_specs::exists("type")};
+  auto [err, result] = coll.lookup_in(std::string(key), specs).get();
+  if (err.ec() == couchbase::errc::key_value::document_not_found) {
+    return Result<LookupCasResult>::Success(LookupCasResult{.found = false, .cas = 0});
+  }
+  if (err) {
+    return Result<LookupCasResult>::Failure(FromSdkError(err, "lookup_in"));
+  }
+  LookupCasResult out;
+  out.found = true;
+  out.cas = result.cas().value();
+  // Tiny probe — count CAS width so avg_get reflects coherence traffic.
+  KvGetStats::RecordFound(sizeof(std::uint64_t));
+  return Result<LookupCasResult>::Success(out);
 }
 
 Result<MutationResult> CouchbaseClient::Upsert(std::string_view collection, std::string_view key,

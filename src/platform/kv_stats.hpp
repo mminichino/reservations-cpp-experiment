@@ -6,19 +6,18 @@
 namespace reservations::platform {
 
 /// Process-wide KV Get telemetry scoped to shop/book operations.
-/// RecordFound accumulates on the calling thread; EndOperation rolls that into
-/// the interval average as "bytes per operation" (not per Get).
+/// RecordFound adds immediately to a shared counter so Gets from GetMany worker
+/// threads are included. EndOperation counts the completed op; avg_get is
+/// interval_bytes / interval_ops (mean found payload per shop/book, not per Get).
 class KvGetStats {
  public:
-  static void RecordFound(std::size_t bytes) { tls_bytes_ += bytes; }
-
-  static void BeginOperation() { tls_bytes_ = 0; }
-
-  static void EndOperation() {
-    ops_.fetch_add(1, std::memory_order_relaxed);
-    bytes_.fetch_add(tls_bytes_, std::memory_order_relaxed);
-    tls_bytes_ = 0;
+  static void RecordFound(std::size_t bytes) {
+    bytes_.fetch_add(bytes, std::memory_order_relaxed);
   }
+
+  static void BeginOperation() {}
+
+  static void EndOperation() { ops_.fetch_add(1, std::memory_order_relaxed); }
 
   struct Snapshot {
     std::uint64_t ops{0};
@@ -37,7 +36,6 @@ class KvGetStats {
   }
 
  private:
-  static inline thread_local std::uint64_t tls_bytes_{0};
   static inline std::atomic<std::uint64_t> ops_{0};
   static inline std::atomic<std::uint64_t> bytes_{0};
 };
