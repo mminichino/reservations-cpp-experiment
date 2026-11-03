@@ -55,7 +55,7 @@ Wire contract: `schema/airline-reservation.schema.json` (seat APIs **and** O&D `
 - Writers (`BookFlight` / Hold / Purchase): `getAndLock` → mutate → `Replace`; unlock on abort
 - Shop prefetches unique inventories via `GetMany` on persistent `KvWorkerPool`
 - Inventory cache entries are `shared_ptr` (lock only copies the pointer)
-- Stats show `cache` size + `avg_get`
+- Stats show `cache` size + `max_get` / `max_put`
 
 ## Layout
 

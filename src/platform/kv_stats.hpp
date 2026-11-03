@@ -14,7 +14,7 @@ struct KvOpAccum {
 };
 
 /// Process-wide KV telemetry for shop/book operations.
-/// avg_get/avg_put = interval body bytes / ops; max_* = max per-op total in the interval.
+/// max_get / max_put = max per-op document body totals in the interval.
 /// Exists probes are not counted (no body).
 class KvGetStats {
  public:
@@ -53,37 +53,19 @@ class KvGetStats {
 
   static void EndOperation() {
     if (tls_op_ != nullptr) {
-      const std::uint64_t g = tls_op_->get_bytes.load(std::memory_order_relaxed);
-      const std::uint64_t p = tls_op_->put_bytes.load(std::memory_order_relaxed);
-      get_bytes_.fetch_add(g, std::memory_order_relaxed);
-      put_bytes_.fetch_add(p, std::memory_order_relaxed);
-      AtomicMax(max_get_, g);
-      AtomicMax(max_put_, p);
+      AtomicMax(max_get_, tls_op_->get_bytes.load(std::memory_order_relaxed));
+      AtomicMax(max_put_, tls_op_->put_bytes.load(std::memory_order_relaxed));
       tls_op_ = nullptr;
     }
-    ops_.fetch_add(1, std::memory_order_relaxed);
   }
 
   struct Snapshot {
-    std::uint64_t ops{0};
-    std::uint64_t get_bytes{0};
-    std::uint64_t put_bytes{0};
     std::uint64_t max_get{0};
     std::uint64_t max_put{0};
-
-    [[nodiscard]] double AvgGetBytesPerOp() const {
-      return ops == 0 ? 0.0 : static_cast<double>(get_bytes) / static_cast<double>(ops);
-    }
-    [[nodiscard]] double AvgPutBytesPerOp() const {
-      return ops == 0 ? 0.0 : static_cast<double>(put_bytes) / static_cast<double>(ops);
-    }
   };
 
   static Snapshot TakeAndReset() {
     Snapshot snap;
-    snap.ops = ops_.exchange(0, std::memory_order_relaxed);
-    snap.get_bytes = get_bytes_.exchange(0, std::memory_order_relaxed);
-    snap.put_bytes = put_bytes_.exchange(0, std::memory_order_relaxed);
     snap.max_get = max_get_.exchange(0, std::memory_order_relaxed);
     snap.max_put = max_put_.exchange(0, std::memory_order_relaxed);
     return snap;
@@ -99,9 +81,6 @@ class KvGetStats {
 
   static inline thread_local OpState tls_storage_{};
   static inline thread_local OpState* tls_op_{nullptr};
-  static inline std::atomic<std::uint64_t> ops_{0};
-  static inline std::atomic<std::uint64_t> get_bytes_{0};
-  static inline std::atomic<std::uint64_t> put_bytes_{0};
   static inline std::atomic<std::uint64_t> max_get_{0};
   static inline std::atomic<std::uint64_t> max_put_{0};
 };

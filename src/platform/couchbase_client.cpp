@@ -428,7 +428,7 @@ Result<ExistsResult> CouchbaseClient::Exists(std::string_view collection, std::s
   ExistsResult out;
   out.found = result.exists();
   out.cas = result.cas().value();
-  // No RecordFound — exists returns no document body (avg_get is body bytes only).
+  // No RecordFound — exists returns no document body.
   return Result<ExistsResult>::Success(out);
 }
 
