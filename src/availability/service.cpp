@@ -10,7 +10,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include "cache/distributed_inventory_fence.hpp"
 #include "common/time_format.hpp"
 #include "domain/pricing.hpp"
 #include "platform/document_store.hpp"
@@ -183,8 +182,6 @@ Result<domain::Flight> KvLoadFlight(platform::CouchbaseClient& client, std::stri
 
 Result<domain::InventoryDocument> KvLoadInventory(platform::CouchbaseClient& client,
                                                   std::string_view flight_id, std::uint64_t reset_epoch) {
-  (void)cache::DistributedInventoryFence::WaitUntilClear(client, flight_id,
-                                                         std::chrono::milliseconds{100});
   platform::DocumentStore<domain::InventoryDocument> store(client, seatmap::kInventoryCollection);
   auto loaded = store.Get(seatmap::InventoryKey(std::string(flight_id)));
   if (!loaded) {

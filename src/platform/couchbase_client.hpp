@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -22,8 +23,8 @@ struct MutationResult {
   std::uint64_t cas{0};
 };
 
-/// Result of a subdoc existence probe that returns the document CAS without the body.
-struct LookupCasResult {
+/// Result of KV exists — CAS without loading the document body.
+struct ExistsResult {
   bool found{false};
   std::uint64_t cas{0};
 };
@@ -55,8 +56,14 @@ class CouchbaseClient {
 
   [[nodiscard]] Result<KvResult> Get(std::string_view collection, std::string_view key);
 
-  /// Subdoc exists("type") — returns document CAS without loading the full body.
-  [[nodiscard]] Result<LookupCasResult> LookupCas(std::string_view collection, std::string_view key);
+  /// KV exists — returns whether the key is present and its CAS (no body).
+  [[nodiscard]] Result<ExistsResult> Exists(std::string_view collection, std::string_view key);
+
+  /// Pessimistic lock for mutation. On document_locked, caller should retry/wait.
+  [[nodiscard]] Result<KvResult> GetAndLock(std::string_view collection, std::string_view key,
+                                            std::chrono::seconds lock_duration);
+
+  [[nodiscard]] Result<void> Unlock(std::string_view collection, std::string_view key, std::uint64_t cas);
 
   [[nodiscard]] Result<MutationResult> Upsert(std::string_view collection, std::string_view key,
                                               std::string_view value,
@@ -73,6 +80,58 @@ class CouchbaseClient {
   struct Impl;
   CouchbaseConfig config_;
   std::unique_ptr<Impl> impl_;
+};
+
+/// RAII unlock unless Release() after a successful Replace (which clears the lock).
+class KvLockGuard {
+ public:
+  KvLockGuard() = default;
+  KvLockGuard(CouchbaseClient* client, std::string collection, std::string key, std::uint64_t cas)
+      : client_(client), collection_(std::move(collection)), key_(std::move(key)), cas_(cas) {}
+
+  KvLockGuard(const KvLockGuard&) = delete;
+  KvLockGuard& operator=(const KvLockGuard&) = delete;
+
+  KvLockGuard(KvLockGuard&& other) noexcept
+      : client_(other.client_),
+        collection_(std::move(other.collection_)),
+        key_(std::move(other.key_)),
+        cas_(other.cas_) {
+    other.client_ = nullptr;
+  }
+
+  KvLockGuard& operator=(KvLockGuard&& other) noexcept {
+    if (this != &other) {
+      Unlock();
+      client_ = other.client_;
+      collection_ = std::move(other.collection_);
+      key_ = std::move(other.key_);
+      cas_ = other.cas_;
+      other.client_ = nullptr;
+    }
+    return *this;
+  }
+
+  ~KvLockGuard() { Unlock(); }
+
+  /// Call after successful Replace so destructor does not Unlock.
+  void Release() { client_ = nullptr; }
+
+  [[nodiscard]] std::uint64_t cas() const noexcept { return cas_; }
+  [[nodiscard]] explicit operator bool() const noexcept { return client_ != nullptr; }
+
+ private:
+  void Unlock() {
+    if (client_ != nullptr) {
+      (void)client_->Unlock(collection_, key_, cas_);
+      client_ = nullptr;
+    }
+  }
+
+  CouchbaseClient* client_{nullptr};
+  std::string collection_;
+  std::string key_;
+  std::uint64_t cas_{0};
 };
 
 }  // namespace reservations::platform

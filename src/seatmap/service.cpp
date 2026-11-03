@@ -6,7 +6,6 @@
 #include <optional>
 #include <sstream>
 
-#include "cache/distributed_inventory_fence.hpp"
 #include "common/time_format.hpp"
 #include "seatmap/synthetic.hpp"
 
@@ -132,8 +131,6 @@ Result<platform::DocumentStore<domain::SeatMapDocument>::Loaded> ReservationServ
 
 Result<platform::DocumentStore<domain::InventoryDocument>::Loaded> ReservationService::LoadInventory(
     const std::string& flight_id) {
-  (void)cache::DistributedInventoryFence::WaitUntilClear(client_, flight_id,
-                                                         std::chrono::milliseconds{100});
   auto loaded = inventory_.Get(InventoryKey(flight_id));
   if (!loaded) {
     return Result<platform::DocumentStore<domain::InventoryDocument>::Loaded>::Failure(loaded.error());
@@ -223,42 +220,20 @@ Result<domain::FlightBookingResponse> ReservationService::BookFlight(
     }
     const auto flight = flight_loaded.value();
 
-    // Local fence (optional) + KV fence (always): cross-process shop waits on fence::inv::<id>.
-    std::optional<cache::FlightWriteFence::Guard> local_fence;
-    if (caches_) {
-      local_fence.emplace(caches_->inventory->Fence(request.flightId));
+    auto locked = inventory_.GetAndLock(InventoryKey(request.flightId));
+    if (!locked) {
+      if (locked.error().code == ErrorCode::RateLimited) {
+        continue;
+      }
+      return Result<domain::FlightBookingResponse>::Failure(locked.error());
     }
-    auto kv_fence = cache::DistributedInventoryFence::Acquire(client_, request.flightId);
-    if (!kv_fence) {
-      return Result<domain::FlightBookingResponse>::Failure(kv_fence.error());
+    auto& inventory = locked.value().first.document;
+    auto& lock_guard = locked.value().second;
+    if (inventory.resetEpoch < catalog_meta_.resetEpoch) {
+      return Result<domain::FlightBookingResponse>::Failure(Error::Make(
+          ErrorCode::NotFound, "Inventory stale vs catalog epoch — re-run load to rematerialize"));
     }
 
-    domain::InventoryDocument inventory;
-    std::uint64_t cas = 0;
-    if (caches_) {
-      auto inv = caches_->inventory->GetForUpdate(client_, request.flightId, catalog_meta_.resetEpoch);
-      if (!inv) {
-        return Result<domain::FlightBookingResponse>::Failure(inv.error());
-      }
-      inventory = inv.value()->document;
-      cas = inv.value()->cas;
-    } else {
-      // Skip LoadInventory's read-side wait — we already hold the KV fence.
-      auto loaded = inventory_.Get(InventoryKey(request.flightId));
-      if (!loaded) {
-        return Result<domain::FlightBookingResponse>::Failure(loaded.error());
-      }
-      if (!loaded.value().has_value()) {
-        return Result<domain::FlightBookingResponse>::Failure(
-            Error::Make(ErrorCode::NotFound, "Inventory missing — run load to materialize catalog"));
-      }
-      if (loaded.value()->document.resetEpoch < catalog_meta_.resetEpoch) {
-        return Result<domain::FlightBookingResponse>::Failure(Error::Make(
-            ErrorCode::NotFound, "Inventory stale vs catalog epoch — re-run load to rematerialize"));
-      }
-      inventory = loaded.value()->document;
-      cas = loaded.value()->cas;
-    }
     const int qty = static_cast<int>(request.passengers.size());
     if (inventory.sold + qty > inventory.authorization) {
       return Result<domain::FlightBookingResponse>::Success(
@@ -287,21 +262,21 @@ Result<domain::FlightBookingResponse> ReservationService::BookFlight(
         }
       }
     }
-    auto replaced = inventory_.Replace(InventoryKey(request.flightId), inventory, cas);
+    auto replaced =
+        inventory_.Replace(InventoryKey(request.flightId), inventory, lock_guard.cas());
     if (!replaced) {
       if (replaced.error().code == ErrorCode::VersionConflict) {
         if (caches_) {
           caches_->inventory->Invalidate(request.flightId);
         }
-        continue;  // kv_fence Guard releases; next attempt re-acquires
+        continue;  // lock released by KvLockGuard / failed replace path
       }
       return Result<domain::FlightBookingResponse>::Failure(replaced.error());
     }
+    lock_guard.Release();  // Replace cleared the lock
     if (caches_) {
       caches_->inventory->Put(request.flightId, inventory, replaced.value().cas, catalog_meta_.resetEpoch);
     }
-    // Peer shops detect this revision via subdoc CAS on the inventory key (no sidecar).
-    // kv_fence / local_fence release as they leave scope after successful mutate.
 
     const std::string locator = locators_.Next();
     const std::string confirmation = "CONF-" + locator;
@@ -464,11 +439,20 @@ Result<domain::SeatHoldResponse> ReservationService::HoldSeats(const domain::Sea
           Error::Make(ErrorCode::FlightClosedForSales, "Seat selection is closed for this flight"));
     }
 
-    auto map = LoadSeatMap(request.flightId);
-    if (!map) {
-      return Result<domain::SeatHoldResponse>::Failure(map.error());
+    auto locked = seatmaps_.GetAndLock(SeatMapKey(request.flightId));
+    if (!locked) {
+      if (locked.error().code == ErrorCode::RateLimited) {
+        continue;
+      }
+      return Result<domain::SeatHoldResponse>::Failure(locked.error());
     }
-    if (request.seatMapVersion.has_value() && *request.seatMapVersion != map.value().document.seatMapVersion) {
+    auto& doc = locked.value().first.document;
+    auto& lock_guard = locked.value().second;
+    if (doc.resetEpoch < catalog_meta_.resetEpoch) {
+      return Result<domain::SeatHoldResponse>::Failure(Error::Make(
+          ErrorCode::NotFound, "Seat map stale vs catalog epoch — re-run load to rematerialize"));
+    }
+    if (request.seatMapVersion.has_value() && *request.seatMapVersion != doc.seatMapVersion) {
       return Result<domain::SeatHoldResponse>::Failure(
           Error::Make(ErrorCode::SeatMapStale, "Seat map version is stale"));
     }
@@ -481,7 +465,6 @@ Result<domain::SeatHoldResponse> ReservationService::HoldSeats(const domain::Sea
     response.totalPrice.currency = "USD";
     response.totalPrice.amountMinor = 0;
 
-    auto& doc = map.value().document;
     for (const auto& seat_number : request.seats) {
       auto it = std::find_if(doc.seats.begin(), doc.seats.end(),
                              [&](const domain::Seat& s) { return s.seatNumber == seat_number; });
@@ -504,13 +487,14 @@ Result<domain::SeatHoldResponse> ReservationService::HoldSeats(const domain::Sea
     doc.seatMapVersion = "v" + std::to_string(std::stoll(doc.seatMapVersion.substr(1)) + 1);
     doc.updatedAt = FormatRfc3339(clock_.Now());
 
-    auto replaced = seatmaps_.Replace(SeatMapKey(request.flightId), doc, map.value().cas);
+    auto replaced = seatmaps_.Replace(SeatMapKey(request.flightId), doc, lock_guard.cas());
     if (!replaced) {
       if (replaced.error().code == ErrorCode::VersionConflict) {
         continue;
       }
       return Result<domain::SeatHoldResponse>::Failure(replaced.error());
     }
+    lock_guard.Release();
 
     domain::HoldDocument hold;
     hold.holdId = response.holdId;
@@ -599,15 +583,23 @@ Result<domain::SeatPurchaseResponse> ReservationService::PurchaseSeats(
       }
     }
 
-    auto map = LoadSeatMap(request.flightId);
-    if (!map) {
-      return Result<domain::SeatPurchaseResponse>::Failure(map.error());
+    auto locked = seatmaps_.GetAndLock(SeatMapKey(request.flightId));
+    if (!locked) {
+      if (locked.error().code == ErrorCode::RateLimited) {
+        continue;
+      }
+      return Result<domain::SeatPurchaseResponse>::Failure(locked.error());
+    }
+    auto& doc = locked.value().first.document;
+    auto& lock_guard = locked.value().second;
+    if (doc.resetEpoch < catalog_meta_.resetEpoch) {
+      return Result<domain::SeatPurchaseResponse>::Failure(Error::Make(
+          ErrorCode::NotFound, "Seat map stale vs catalog epoch — re-run load to rematerialize"));
     }
 
     std::int64_t total = 0;
     std::string currency = request.expectedTotal.currency;
     std::vector<domain::SeatAssignment> assignments;
-    auto& doc = map.value().document;
 
     for (const auto& selection : request.seatSelections) {
       auto it = std::find_if(doc.seats.begin(), doc.seats.end(),
@@ -658,13 +650,14 @@ Result<domain::SeatPurchaseResponse> ReservationService::PurchaseSeats(
     doc.seatMapVersion = "v" + std::to_string(std::stoll(doc.seatMapVersion.substr(1)) + 1);
     doc.updatedAt = FormatRfc3339(clock_.Now());
 
-    auto replaced = seatmaps_.Replace(SeatMapKey(request.flightId), doc, map.value().cas);
+    auto replaced = seatmaps_.Replace(SeatMapKey(request.flightId), doc, lock_guard.cas());
     if (!replaced) {
       if (replaced.error().code == ErrorCode::VersionConflict) {
         continue;
       }
       return Result<domain::SeatPurchaseResponse>::Failure(replaced.error());
     }
+    lock_guard.Release();
 
     if (hold_doc.has_value() && CanTransition(hold_doc->state, domain::HoldState::Consumed)) {
       hold_doc->state = domain::HoldState::Consumed;

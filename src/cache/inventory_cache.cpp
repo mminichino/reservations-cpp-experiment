@@ -1,7 +1,6 @@
 #include "cache/inventory_cache.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -9,26 +8,10 @@
 
 #include <rfl/json.hpp>
 
-#include "cache/distributed_inventory_fence.hpp"
 #include "platform/document_store.hpp"
 #include "seatmap/service.hpp"
 
 namespace reservations::cache {
-namespace {
-
-[[nodiscard]] Result<std::optional<std::uint64_t>> FetchInventoryCas(platform::CouchbaseClient& client,
-                                                                     std::string_view flight_id) {
-  auto probed = client.LookupCas(seatmap::kInventoryCollection, seatmap::InventoryKey(std::string(flight_id)));
-  if (!probed) {
-    return Result<std::optional<std::uint64_t>>::Failure(probed.error());
-  }
-  if (!probed.value().found) {
-    return Result<std::optional<std::uint64_t>>::Success(std::nullopt);
-  }
-  return Result<std::optional<std::uint64_t>>::Success(probed.value().cas);
-}
-
-}  // namespace
 
 Result<std::shared_ptr<const InventoryCache::Entry>> InventoryCache::LoadFromKv(
     platform::CouchbaseClient& client, std::string_view flight_id, std::uint64_t reset_epoch) {
@@ -67,29 +50,26 @@ std::uint64_t InventoryCache::ApproxBytes() const {
 
 Result<std::shared_ptr<const InventoryCache::Entry>> InventoryCache::Get(
     platform::CouchbaseClient& client, std::string_view flight_id, std::uint64_t reset_epoch) {
-  const bool local_clear = fence_.WaitUntilClear(flight_id, std::chrono::milliseconds{100});
-  const auto remote = DistributedInventoryFence::WaitUntilClear(client, flight_id,
-                                                                std::chrono::milliseconds{100});
+  const std::string key = seatmap::InventoryKey(std::string(flight_id));
 
-  // Serve cache only when fences are clear, no remote fence was seen, and a subdoc CAS probe
-  // still matches the cached inventory CAS (cross-process freshness).
-  const bool allow_cache = local_clear && remote.clear && !remote.saw_fence;
-  if (allow_cache) {
-    std::shared_ptr<const Entry> cached;
-    {
-      std::lock_guard lock(mu_);
-      auto it = entries_.find(std::string(flight_id));
-      if (it != entries_.end() && it->second->resetEpoch >= reset_epoch) {
-        cached = it->second;
-      }
+  std::shared_ptr<const Entry> cached;
+  {
+    std::lock_guard lock(mu_);
+    auto it = entries_.find(std::string(flight_id));
+    if (it != entries_.end() && it->second->resetEpoch >= reset_epoch) {
+      cached = it->second;
     }
-    if (cached) {
-      auto cas = FetchInventoryCas(client, flight_id);
-      if (cas && cas.value().has_value() && *cas.value() == cached->cas) {
-        return Result<std::shared_ptr<const Entry>>::Success(std::move(cached));
-      }
-      // Missing doc or CAS mismatch → fall through to full inventory load.
+  }
+
+  if (cached) {
+    auto exists = client.Exists(seatmap::kInventoryCollection, key);
+    if (!exists) {
+      return Result<std::shared_ptr<const Entry>>::Failure(exists.error());
     }
+    if (exists.value().found && exists.value().cas == cached->cas) {
+      return Result<std::shared_ptr<const Entry>>::Success(std::move(cached));
+    }
+    // Missing or newer CAS → full load below.
   }
 
   auto loaded = LoadFromKv(client, flight_id, reset_epoch);
@@ -142,16 +122,6 @@ InventoryCache::GetMany(const CouchbaseConfig& config, const std::vector<std::st
     return Result<std::unordered_map<std::string, std::shared_ptr<const Entry>>>::Failure(ran.error());
   }
   return Result<std::unordered_map<std::string, std::shared_ptr<const Entry>>>::Success(std::move(out));
-}
-
-Result<std::shared_ptr<const InventoryCache::Entry>> InventoryCache::GetForUpdate(
-    platform::CouchbaseClient& client, std::string_view flight_id, std::uint64_t reset_epoch) {
-  auto loaded = LoadFromKv(client, flight_id, reset_epoch);
-  if (!loaded) {
-    return loaded;
-  }
-  StoreEntry(flight_id, loaded.value());
-  return loaded;
 }
 
 void InventoryCache::Put(std::string_view flight_id, domain::InventoryDocument document, std::uint64_t cas,

@@ -13,7 +13,6 @@
 #include <couchbase/codec/encoded_value.hxx>
 #include <couchbase/codec/raw_json_transcoder.hxx>
 #include <couchbase/codec/transcoder_traits.hxx>
-#include <couchbase/lookup_in_specs.hxx>
 #include <curl/curl.h>
 #include <fmt/format.h>
 #include <system_error>
@@ -137,6 +136,9 @@ Error FromSdkError(const couchbase::error& err, const char* what) {
   }
   if (err.ec() == couchbase::errc::key_value::document_not_found) {
     return Error::Make(ErrorCode::NotFound, std::string(what) + ": document not found");
+  }
+  if (err.ec() == couchbase::errc::key_value::document_locked) {
+    return Error::Make(ErrorCode::DocumentLocked, std::string(what) + ": document locked");
   }
   return Error::Make(ErrorCode::InternalError, fmt::format("{}: {}", what, FormatSdkError(err)));
 }
@@ -413,27 +415,65 @@ Result<KvResult> CouchbaseClient::Get(std::string_view collection, std::string_v
   return Result<KvResult>::Success(std::move(out));
 }
 
-Result<LookupCasResult> CouchbaseClient::LookupCas(std::string_view collection, std::string_view key) {
+Result<ExistsResult> CouchbaseClient::Exists(std::string_view collection, std::string_view key) {
   std::scoped_lock lock(impl_->mutex);
   if (!impl_->cluster.has_value()) {
-    return Result<LookupCasResult>::Failure(
-        Error::Make(ErrorCode::ConnectionError, "cluster not connected"));
+    return Result<ExistsResult>::Failure(Error::Make(ErrorCode::ConnectionError, "cluster not connected"));
   }
   auto coll = CollectionFor(*impl_->cluster, config_, collection);
-  const couchbase::lookup_in_specs specs{couchbase::lookup_in_specs::exists("type")};
-  auto [err, result] = coll.lookup_in(std::string(key), specs).get();
-  if (err.ec() == couchbase::errc::key_value::document_not_found) {
-    return Result<LookupCasResult>::Success(LookupCasResult{.found = false, .cas = 0});
+  auto [err, result] = coll.exists(std::string(key)).get();
+  if (err) {
+    return Result<ExistsResult>::Failure(FromSdkError(err, "exists"));
+  }
+  ExistsResult out;
+  out.found = result.exists();
+  out.cas = result.cas().value();
+  if (out.found) {
+    KvGetStats::RecordFound(sizeof(std::uint64_t));
+  }
+  return Result<ExistsResult>::Success(out);
+}
+
+Result<KvResult> CouchbaseClient::GetAndLock(std::string_view collection, std::string_view key,
+                                             std::chrono::seconds lock_duration) {
+  std::scoped_lock lock(impl_->mutex);
+  if (!impl_->cluster.has_value()) {
+    return Result<KvResult>::Failure(Error::Make(ErrorCode::ConnectionError, "cluster not connected"));
+  }
+  auto coll = CollectionFor(*impl_->cluster, config_, collection);
+  auto [err, result] = coll.get_and_lock(std::string(key), lock_duration).get();
+  if (err) {
+    return Result<KvResult>::Failure(FromSdkError(err, "get_and_lock"));
+  }
+  KvResult out;
+  out.found = true;
+  try {
+    out.value = result.template content_as<std::string, permissive_json_string_transcoder>();
+  } catch (const std::system_error& ex) {
+    return Result<KvResult>::Failure(
+        Error::Make(ErrorCode::InternalError, fmt::format("get_and_lock decode: {}", ex.what())));
+  }
+  out.cas = result.cas().value();
+  KvGetStats::RecordFound(out.value.size());
+  return Result<KvResult>::Success(std::move(out));
+}
+
+Result<void> CouchbaseClient::Unlock(std::string_view collection, std::string_view key, std::uint64_t cas) {
+  std::scoped_lock lock(impl_->mutex);
+  if (!impl_->cluster.has_value()) {
+    return Result<void>::Failure(Error::Make(ErrorCode::ConnectionError, "cluster not connected"));
+  }
+  auto coll = CollectionFor(*impl_->cluster, config_, collection);
+  auto err = coll.unlock(std::string(key), couchbase::cas{cas}).get();
+  if (err.ec() == couchbase::errc::key_value::document_not_found ||
+      err.ec() == couchbase::errc::common::cas_mismatch) {
+    // Already unlocked via Replace, or lock expired — treat as clear.
+    return Result<void>::Success();
   }
   if (err) {
-    return Result<LookupCasResult>::Failure(FromSdkError(err, "lookup_in"));
+    return Result<void>::Failure(FromSdkError(err, "unlock"));
   }
-  LookupCasResult out;
-  out.found = true;
-  out.cas = result.cas().value();
-  // Tiny probe — count CAS width so avg_get reflects coherence traffic.
-  KvGetStats::RecordFound(sizeof(std::uint64_t));
-  return Result<LookupCasResult>::Success(out);
+  return Result<void>::Success();
 }
 
 Result<MutationResult> CouchbaseClient::Upsert(std::string_view collection, std::string_view key,

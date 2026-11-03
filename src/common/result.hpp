@@ -25,6 +25,7 @@ enum class ErrorCode {
   RateLimited,
   InternalError,
   VersionConflict,
+  DocumentLocked,
   NotFound,
   AlreadyExists,
   ConfigError,
@@ -67,6 +68,8 @@ enum class ErrorCode {
       return "INTERNAL_ERROR";
     case ErrorCode::VersionConflict:
       return "INTERNAL_ERROR";
+    case ErrorCode::DocumentLocked:
+      return "RATE_LIMITED";
     case ErrorCode::NotFound:
       return "INTERNAL_ERROR";
     case ErrorCode::AlreadyExists:
@@ -82,6 +85,7 @@ enum class ErrorCode {
 [[nodiscard]] constexpr bool IsRetryable(ErrorCode code) noexcept {
   switch (code) {
     case ErrorCode::RateLimited:
+    case ErrorCode::DocumentLocked:
     case ErrorCode::InternalError:
     case ErrorCode::VersionConflict:
     case ErrorCode::ConnectionError:

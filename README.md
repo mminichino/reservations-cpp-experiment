@@ -246,11 +246,10 @@ Optional via `exercise -C` (default off = pure KV / reflect-cpp, no prerun). Whe
 | `ScheduleCache` | OD index + flight docs (warm + miss fill) |
 | `InventoryCache` | Local + Couchbase fence; write-through; warm fills all flights |
 
-**Inventory coherence (book always, with or without `-C`):**
-- **Fence:** `BookFlight` Upserts `fence::inv::<flightId>` (TTL 5s), Removes on release. Shop waits (~100ms); if a fence was seen, full inventory KV refill.
-- **Subdoc CAS probe:** cached shop does `lookup_in` (exists `type`) on the inventory key and compares the returned document CAS to the local entry—full inventory refill on mismatch. No `inv_gen` sidecar write on book.
-- **Parallel inventory prefetch:** `ClassAvailability` collects journey candidates, then `InventoryCache::GetMany` / pure-KV equivalent loads unique flights via a persistent `KvWorkerPool` (dedicated `CouchbaseClient` per long-lived worker thread) so fence/CAS-probe/inventory ops overlap without per-request thread spawn.
-- Local `FlightWriteFence` for in-process writers; inventory CAS remains write authority.
+**Inventory / seat-map coherence (book always, with or without `-C`):**
+- **Shop inventory:** KV `exists` on `inv::<flightId>`; cache hit if CAS matches local entry, otherwise full Get. Shops do not wait on writers (may briefly see pre-sale inventory until Replace).
+- **Writers:** `BookFlight` / `HoldSeats` / `PurchaseSeats` use `getAndLock` (TTL 5s, wait up to ~2s on `document_locked`), mutate, `Replace` (clears lock); `Unlock` on abort. No `fence::inv` keys.
+- **Parallel inventory prefetch:** `ClassAvailability` collects journey candidates, then `InventoryCache::GetMany` / pure-KV equivalent via persistent `KvWorkerPool`.
 
 Stats columns `cache` / `avg_get` always print (`cache` is `0B` without `-C`). `avg_get` is mean found-document payload **per shop/book operation** (sum of Gets/subdoc probes in that op, including work done on `KvWorkerPool` threads), not per individual Get.
 
@@ -260,7 +259,7 @@ Stats columns `cache` / `avg_get` always print (`cache` is `0B` without `-C`). `
 |---|---|
 | `ClassAvailabilityService::Check` | O&D class shopping via caches: journeys, price match/precedence, open/close vs controls |
 | `CheckAvailability` | Seat-map view for one flight; empty seats OK when nothing selectable |
-| `BookFlight` | Fenced sell of booking class (default Y) up to AU; PNR without seat assignment |
+| `BookFlight` | Locked sell of booking class (default Y) up to AU; PNR without seat assignment |
 | `HoldSeats` / `PurchaseSeats` | Physical seat hold / assignment (ancillary path) |
 
 Overselling bookings past physical seats is intentional (AU). Seat selection then simply shows an empty map rather than failing the ticket.
