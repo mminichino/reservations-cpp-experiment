@@ -9,6 +9,7 @@
 #include <rfl/json.hpp>
 
 #include "platform/document_store.hpp"
+#include "platform/kv_stats.hpp"
 #include "seatmap/service.hpp"
 
 namespace reservations::cache {
@@ -109,7 +110,9 @@ InventoryCache::GetMany(const CouchbaseConfig& config, const std::vector<std::st
   }
 
   std::mutex out_mu;
+  platform::KvGetStats::OpState* parent_op = platform::KvGetStats::CurrentOp();
   auto ran = workers_->ParallelFor(ids.size(), [&](platform::CouchbaseClient& client, std::size_t i) {
+    platform::KvGetStats::BindOp bind(parent_op);
     auto loaded = Get(client, ids[i], reset_epoch);
     if (!loaded) {
       return Result<void>::Failure(loaded.error());

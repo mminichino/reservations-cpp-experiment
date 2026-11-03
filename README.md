@@ -251,7 +251,7 @@ Optional via `exercise -C` (default off = pure KV / reflect-cpp, no prerun). Whe
 - **Writers:** `BookFlight` / `HoldSeats` / `PurchaseSeats` use `getAndLock` (TTL 5s, wait up to ~2s on `document_locked`), mutate, `Replace` (clears lock); `Unlock` on abort. No `fence::inv` keys.
 - **Parallel inventory prefetch:** `ClassAvailability` collects journey candidates, then `InventoryCache::GetMany` / pure-KV equivalent via persistent `KvWorkerPool`.
 
-Stats columns `cache` / `avg_get` always print (`cache` is `0B` without `-C`). `avg_get` is mean found-document payload **per shop/book operation** (sum of Gets/subdoc probes in that op, including work done on `KvWorkerPool` threads), not per individual Get.
+Stats columns `cache` / `avg_get` always print (`cache` is `0B` without `-C`). `avg_get` is mean **document body** bytes pulled per shop/book operation (Gets / getAndLock on the op thread and bound `KvWorkerPool` workers). KV `exists` probes are not counted (no body).
 
 ### Main APIs (`ReservationService`)
 

@@ -13,6 +13,7 @@
 #include "common/time_format.hpp"
 #include "domain/pricing.hpp"
 #include "platform/document_store.hpp"
+#include "platform/kv_stats.hpp"
 #include "platform/kv_worker_pool.hpp"
 #include "pricing/engine.hpp"
 #include "seatmap/service.hpp"
@@ -224,7 +225,9 @@ Result<std::unordered_map<std::string, domain::InventoryDocument>> KvLoadInvento
 
   auto& workers = SharedPureKvWorkers(config);
   std::mutex out_mu;
+  platform::KvGetStats::OpState* parent_op = platform::KvGetStats::CurrentOp();
   auto ran = workers.ParallelFor(ids.size(), [&](platform::CouchbaseClient& client, std::size_t i) {
+    platform::KvGetStats::BindOp bind(parent_op);
     auto loaded = KvLoadInventory(client, ids[i], reset_epoch);
     if (!loaded) {
       return Result<void>::Failure(loaded.error());
