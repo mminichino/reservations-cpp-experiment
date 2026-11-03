@@ -1,16 +1,20 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <vector>
 
 #include "cache/flight_write_fence.hpp"
+#include "common/env.hpp"
 #include "common/result.hpp"
 #include "domain/types.hpp"
 #include "platform/couchbase_client.hpp"
+#include "platform/kv_client_pool.hpp"
 
 namespace reservations::cache {
 
@@ -26,6 +30,8 @@ class InventoryCache {
     std::uint64_t bytes{0};
   };
 
+  static constexpr int kDefaultGetManyParallelism = 16;
+
   [[nodiscard]] FlightWriteFence::Guard Fence(std::string flight_id) {
     return fence_.Acquire(std::move(flight_id));
   }
@@ -33,6 +39,12 @@ class InventoryCache {
   /// Wait for fence, then return cached entry or load from KV and fill.
   [[nodiscard]] Result<Entry> Get(platform::CouchbaseClient& client, std::string_view flight_id,
                                   std::uint64_t reset_epoch);
+
+  /// Parallel Get for many flights. Each worker leases its own CouchbaseClient from a pool
+  /// so KV ops overlap. Same per-flight fence/gen/load workflow as Get.
+  [[nodiscard]] Result<std::unordered_map<std::string, Entry>> GetMany(
+      const CouchbaseConfig& config, const std::vector<std::string>& flight_ids,
+      std::uint64_t reset_epoch, int parallelism = kDefaultGetManyParallelism);
 
   /// Authoritative KV get (used under fence for BookFlight before CAS). Still waits for other writers.
   [[nodiscard]] Result<Entry> GetForUpdate(platform::CouchbaseClient& client, std::string_view flight_id,
@@ -51,11 +63,15 @@ class InventoryCache {
  private:
   [[nodiscard]] Result<Entry> LoadFromKv(platform::CouchbaseClient& client, std::string_view flight_id,
                                          std::uint64_t reset_epoch);
+  [[nodiscard]] Result<void> EnsurePool(const CouchbaseConfig& config, int capacity);
 
   FlightWriteFence fence_;
   mutable std::mutex mu_;
   std::uint64_t approx_bytes_{0};
   std::unordered_map<std::string, Entry> entries_;
+
+  std::mutex pool_mu_;
+  std::unique_ptr<platform::KvClientPool> kv_pool_;
 };
 
 }  // namespace reservations::cache

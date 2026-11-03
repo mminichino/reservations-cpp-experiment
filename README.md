@@ -249,6 +249,7 @@ Optional via `exercise -C` (default off = pure KV / reflect-cpp, no prerun). Whe
 **Inventory coherence (book always, with or without `-C`):**
 - **Fence:** `BookFlight` Upserts `fence::inv::<flightId>` (TTL 5s), Removes on release. Shop waits (~100ms); if a fence was seen, full inventory KV refill.
 - **Generation sidecar:** after successful inventory CAS, Upsert `inv_gen::<flightId>` `{cas}`. Cached shop Gets the sidecar; cache hit only if `cas` matches the local entry—otherwise full inventory refill. Keeps cross-process freshness after the fence is gone without pulling ~1.5 KiB inventory on every hit.
+- **Parallel inventory prefetch:** `ClassAvailability` collects journey candidates, then `InventoryCache::GetMany` / pure-KV equivalent loads unique flights concurrently. Workers lease dedicated clients from a persistent `KvClientPool` (one client per worker, not shared across threads) so fence/gen/inventory Gets overlap without reconnect cost.
 - Local `FlightWriteFence` for in-process writers; inventory CAS remains write authority.
 
 Stats columns `cache` / `avg_get` always print (`cache` is `0B` without `-C`). `avg_get` is mean found-document payload **per shop/book operation** (sum of Gets in that op), not per individual Get.

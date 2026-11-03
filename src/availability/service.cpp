@@ -1,14 +1,22 @@
 #include "availability/service.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <memory>
+#include <mutex>
 #include <set>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <vector>
 
 #include "cache/distributed_inventory_fence.hpp"
 #include "common/time_format.hpp"
 #include "domain/pricing.hpp"
 #include "platform/document_store.hpp"
+#include "platform/kv_client_pool.hpp"
 #include "pricing/engine.hpp"
 #include "seatmap/service.hpp"
 
@@ -191,6 +199,91 @@ Result<domain::InventoryDocument> KvLoadInventory(platform::CouchbaseClient& cli
   return Result<domain::InventoryDocument>::Success(std::move(loaded.value()->document));
 }
 
+platform::KvClientPool& SharedPureKvPool(const CouchbaseConfig& config) {
+  static std::mutex mu;
+  static std::unique_ptr<platform::KvClientPool> pool;
+  static std::string conn;
+  std::lock_guard lock(mu);
+  if (!pool || conn != config.connection_string) {
+    pool = std::make_unique<platform::KvClientPool>(config, 64);
+    conn = config.connection_string;
+  }
+  return *pool;
+}
+
+/// Parallel pure-KV inventory loads; workers lease dedicated clients from a shared pool.
+Result<std::unordered_map<std::string, domain::InventoryDocument>> KvLoadInventoriesMany(
+    const CouchbaseConfig& config, const std::vector<std::string>& flight_ids, std::uint64_t reset_epoch,
+    int parallelism = 16) {
+  std::set<std::string> unique;
+  for (const auto& id : flight_ids) {
+    if (!id.empty()) {
+      unique.insert(id);
+    }
+  }
+  std::vector<std::string> ids(unique.begin(), unique.end());
+  std::unordered_map<std::string, domain::InventoryDocument> out;
+  if (ids.empty()) {
+    return Result<std::unordered_map<std::string, domain::InventoryDocument>>::Success(std::move(out));
+  }
+
+  auto& kv_pool = SharedPureKvPool(config);
+  if (auto ready = kv_pool.EnsureReady(); !ready) {
+    return Result<std::unordered_map<std::string, domain::InventoryDocument>>::Failure(ready.error());
+  }
+
+  const int workers = std::max(1, std::min(parallelism, static_cast<int>(ids.size())));
+  std::atomic<std::size_t> next{0};
+  std::atomic<bool> failed{false};
+  std::mutex err_mu;
+  Error first_error = Error::Make(ErrorCode::InternalError, "inventory prefetch failed");
+  std::mutex out_mu;
+
+  std::vector<std::thread> threads;
+  threads.reserve(static_cast<std::size_t>(workers));
+  for (int t = 0; t < workers; ++t) {
+    threads.emplace_back([&] {
+      auto lease = kv_pool.Acquire();
+      if (!lease) {
+        if (!failed.exchange(true)) {
+          std::lock_guard lock(err_mu);
+          first_error = lease.error();
+        }
+        return;
+      }
+      platform::CouchbaseClient& client = *lease.value();
+      while (!failed.load(std::memory_order_relaxed)) {
+        const std::size_t i = next.fetch_add(1, std::memory_order_relaxed);
+        if (i >= ids.size()) {
+          break;
+        }
+        auto loaded = KvLoadInventory(client, ids[i], reset_epoch);
+        if (!loaded) {
+          if (!failed.exchange(true)) {
+            std::lock_guard lock(err_mu);
+            first_error = loaded.error();
+          }
+          return;
+        }
+        std::lock_guard lock(out_mu);
+        out.emplace(ids[i], std::move(loaded.value()));
+      }
+    });
+  }
+  for (auto& th : threads) {
+    th.join();
+  }
+  if (failed.load(std::memory_order_relaxed)) {
+    return Result<std::unordered_map<std::string, domain::InventoryDocument>>::Failure(first_error);
+  }
+  return Result<std::unordered_map<std::string, domain::InventoryDocument>>::Success(std::move(out));
+}
+
+struct JourneyCandidate {
+  std::vector<std::string> flight_ids;
+  std::vector<domain::Market> markets;
+};
+
 }  // namespace
 
 ClassAvailabilityService::ClassAvailabilityService(platform::CouchbaseClient& client, const Clock& clock,
@@ -282,29 +375,118 @@ Result<domain::ClassAvailabilityResponse> ClassAvailabilityService::Check(
       directs_ptr = std::make_shared<const std::vector<std::string>>(std::move(directs.value()));
     }
 
-    int journey_count = 0;
-    auto add_journey = [&](std::vector<std::string> flight_ids, const std::vector<domain::Market>& markets) {
-      if (journey_count >= max_journeys) {
-        slice_out.journeysTruncated = true;
+    // Build journey candidates first, then prefetch inventory for all unique flights in parallel.
+    std::vector<JourneyCandidate> candidates;
+    candidates.reserve(static_cast<std::size_t>(max_journeys));
+    bool truncated = false;
+
+    auto push_candidate = [&](std::vector<std::string> flight_ids, std::vector<domain::Market> markets) {
+      if (static_cast<int>(candidates.size()) >= max_journeys) {
+        truncated = true;
         return;
       }
+      candidates.push_back(
+          JourneyCandidate{.flight_ids = std::move(flight_ids), .markets = std::move(markets)});
+    };
+
+    for (const auto& fid : *directs_ptr) {
+      push_candidate({fid}, {market});
+    }
+
+    if (max_conn >= 1) {
+      for (const auto hub : schedule::kConnectionHubs) {
+        if (hub == slice.origin || hub == slice.destination) {
+          continue;
+        }
+        std::shared_ptr<const std::vector<std::string>> leg1_ptr;
+        std::shared_ptr<const std::vector<std::string>> leg2_ptr;
+        if (use_cache) {
+          auto leg1 = caches_->schedule->GetDirectFlights(client_, slice.origin, hub, slice.departureDate,
+                                                          catalog_meta_.resetEpoch);
+          auto leg2 = caches_->schedule->GetDirectFlights(client_, hub, slice.destination,
+                                                          slice.departureDate, catalog_meta_.resetEpoch);
+          if (!leg1 || !leg2 || leg1.value()->empty() || leg2.value()->empty()) {
+            continue;
+          }
+          leg1_ptr = leg1.value();
+          leg2_ptr = leg2.value();
+        } else {
+          auto leg1 = KvDirectFlights(client_, slice.origin, hub, slice.departureDate, catalog_meta_.resetEpoch);
+          auto leg2 =
+              KvDirectFlights(client_, hub, slice.destination, slice.departureDate, catalog_meta_.resetEpoch);
+          if (!leg1 || !leg2 || leg1.value().empty() || leg2.value().empty()) {
+            continue;
+          }
+          leg1_ptr = std::make_shared<const std::vector<std::string>>(std::move(leg1.value()));
+          leg2_ptr = std::make_shared<const std::vector<std::string>>(std::move(leg2.value()));
+        }
+        const std::size_t n1 = std::min<std::size_t>(leg1_ptr->size(), 2);
+        const std::size_t n2 = std::min<std::size_t>(leg2_ptr->size(), 2);
+        for (std::size_t i = 0; i < n1; ++i) {
+          for (std::size_t j = 0; j < n2; ++j) {
+            push_candidate({(*leg1_ptr)[i], (*leg2_ptr)[j]},
+                           {domain::Market{.origin = slice.origin, .destination = std::string(hub)},
+                            domain::Market{.origin = std::string(hub), .destination = slice.destination},
+                            market});
+            if (truncated) {
+              break;
+            }
+          }
+          if (truncated) {
+            break;
+          }
+        }
+        if (truncated) {
+          break;
+        }
+      }
+    }
+
+    std::vector<std::string> prefetch_ids;
+    for (const auto& c : candidates) {
+      for (const auto& fid : c.flight_ids) {
+        prefetch_ids.push_back(fid);
+      }
+    }
+
+    std::unordered_map<std::string, domain::InventoryDocument> inv_by_flight;
+    if (use_cache) {
+      auto many = caches_->inventory->GetMany(client_.config(), prefetch_ids, catalog_meta_.resetEpoch);
+      if (!many) {
+        return Result<domain::ClassAvailabilityResponse>::Failure(many.error());
+      }
+      inv_by_flight.reserve(many.value().size());
+      for (auto& [fid, entry] : many.value()) {
+        inv_by_flight.emplace(fid, std::move(entry.document));
+      }
+    } else {
+      auto many = KvLoadInventoriesMany(client_.config(), prefetch_ids, catalog_meta_.resetEpoch);
+      if (!many) {
+        return Result<domain::ClassAvailabilityResponse>::Failure(many.error());
+      }
+      inv_by_flight = std::move(many.value());
+    }
+
+    int journey_count = 0;
+    for (const auto& cand : candidates) {
       domain::Journey journey;
       journey.journeyId = "J-" + std::to_string(si) + "-" + std::to_string(journey_count);
-      journey.connectionCount = static_cast<int>(flight_ids.size()) - 1;
-      journey.markets = markets;
+      journey.connectionCount = static_cast<int>(cand.flight_ids.size()) - 1;
+      journey.markets = cand.markets;
 
       bool ok = true;
-      for (std::size_t seg_i = 0; seg_i < flight_ids.size(); ++seg_i) {
+      for (std::size_t seg_i = 0; seg_i < cand.flight_ids.size(); ++seg_i) {
+        const auto& flight_id = cand.flight_ids[seg_i];
         domain::Flight flight_doc;
         if (use_cache) {
-          auto flight = caches_->schedule->GetFlight(client_, flight_ids[seg_i]);
+          auto flight = caches_->schedule->GetFlight(client_, flight_id);
           if (!flight) {
             ok = false;
             break;
           }
           flight_doc = *flight.value();
         } else {
-          auto flight = KvLoadFlight(client_, flight_ids[seg_i]);
+          auto flight = KvLoadFlight(client_, flight_id);
           if (!flight) {
             ok = false;
             break;
@@ -312,28 +494,18 @@ Result<domain::ClassAvailabilityResponse> ClassAvailabilityService::Check(
           flight_doc = std::move(flight.value());
         }
 
+        auto inv_it = inv_by_flight.find(flight_id);
+        if (inv_it == inv_by_flight.end()) {
+          ok = false;
+          break;
+        }
+        const auto& inv_doc = inv_it->second;
+
         domain::JourneySegment seg;
         seg.segmentIndex = static_cast<int>(seg_i);
         seg.flight = std::move(flight_doc);
         seg.boardPoint = seg.flight.origin;
         seg.offPoint = seg.flight.destination;
-
-        domain::InventoryDocument inv_doc;
-        if (use_cache) {
-          auto inv = caches_->inventory->Get(client_, flight_ids[seg_i], catalog_meta_.resetEpoch);
-          if (!inv) {
-            ok = false;
-            break;
-          }
-          inv_doc = inv.value().document;
-        } else {
-          auto inv = KvLoadInventory(client_, flight_ids[seg_i], catalog_meta_.resetEpoch);
-          if (!inv) {
-            ok = false;
-            break;
-          }
-          inv_doc = std::move(inv.value());
-        }
 
         domain::Market seg_market{.origin = seg.boardPoint, .destination = seg.offPoint};
         std::shared_ptr<const std::vector<domain::PriceRecord>> seg_prices_ptr = prices_ptr;
@@ -387,61 +559,12 @@ Result<domain::ClassAvailabilityResponse> ClassAvailabilityService::Check(
         journey.segments.push_back(std::move(seg));
       }
       if (!ok || journey.segments.empty()) {
-        return;
+        continue;
       }
       slice_out.journeys.push_back(std::move(journey));
       ++journey_count;
-    };
-
-    for (const auto& fid : *directs_ptr) {
-      add_journey({fid}, {market});
     }
-
-    if (max_conn >= 1) {
-      for (const auto hub : schedule::kConnectionHubs) {
-        if (hub == slice.origin || hub == slice.destination) {
-          continue;
-        }
-        std::shared_ptr<const std::vector<std::string>> leg1_ptr;
-        std::shared_ptr<const std::vector<std::string>> leg2_ptr;
-        if (use_cache) {
-          auto leg1 = caches_->schedule->GetDirectFlights(client_, slice.origin, hub, slice.departureDate,
-                                                          catalog_meta_.resetEpoch);
-          auto leg2 = caches_->schedule->GetDirectFlights(client_, hub, slice.destination,
-                                                          slice.departureDate, catalog_meta_.resetEpoch);
-          if (!leg1 || !leg2 || leg1.value()->empty() || leg2.value()->empty()) {
-            continue;
-          }
-          leg1_ptr = leg1.value();
-          leg2_ptr = leg2.value();
-        } else {
-          auto leg1 = KvDirectFlights(client_, slice.origin, hub, slice.departureDate, catalog_meta_.resetEpoch);
-          auto leg2 =
-              KvDirectFlights(client_, hub, slice.destination, slice.departureDate, catalog_meta_.resetEpoch);
-          if (!leg1 || !leg2 || leg1.value().empty() || leg2.value().empty()) {
-            continue;
-          }
-          leg1_ptr = std::make_shared<const std::vector<std::string>>(std::move(leg1.value()));
-          leg2_ptr = std::make_shared<const std::vector<std::string>>(std::move(leg2.value()));
-        }
-        const std::size_t n1 = std::min<std::size_t>(leg1_ptr->size(), 2);
-        const std::size_t n2 = std::min<std::size_t>(leg2_ptr->size(), 2);
-        for (std::size_t i = 0; i < n1; ++i) {
-          for (std::size_t j = 0; j < n2; ++j) {
-            add_journey({(*leg1_ptr)[i], (*leg2_ptr)[j]},
-                        {domain::Market{.origin = slice.origin, .destination = std::string(hub)},
-                         domain::Market{.origin = std::string(hub), .destination = slice.destination},
-                         market});
-            if (journey_count >= max_journeys) {
-              break;
-            }
-          }
-        }
-        if (journey_count >= max_journeys) {
-          break;
-        }
-      }
-    }
+    slice_out.journeysTruncated = truncated;
 
     response.slices.push_back(std::move(slice_out));
   }

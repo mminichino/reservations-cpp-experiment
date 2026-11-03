@@ -53,6 +53,7 @@ Wire contract: `schema/airline-reservation.schema.json` (seat APIs **and** O&D `
 - Warm loads all price markets (incl. hub legs), OD×date indexes, flights, inventory
 - Inventory fence: KV `fence::inv::<flightId>` (TTL) on every `BookFlight`; readers wait; KV-refill if fence seen
 - Inventory generation sidecar `inv_gen::<flightId>` `{cas}` published after CAS; cached shop hit only if sidecar cas matches entry
+- Shop prefetches unique flight inventories via `GetMany` (workers lease dedicated clients from persistent `KvClientPool`, parallel fence/gen/load)
 - Cached book: local fence → KV fence → GetForUpdate → CAS → Put → publish gen; CAS remains write authority
 - Stats show `cache` size + `avg_get`
 
